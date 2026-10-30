@@ -96,8 +96,12 @@ namespace AVES
             pulldown4.Ext_AddPushButton("3D - MT Tags", "AVES.Commands.Cmd_DOC05a_MT");
             pulldown4.Ext_AddPushButton("3D - Vendor Tags", "AVES.Commands.Cmd_DOC05b_Vendor");
 
-            // Add button to panel
-            var buttonFillSchedules = panelSheets.Ext_AddPushButton("Auto-fill\nSchedules", "AVES.Commands.Cmd_DOC01_FillSchedules");
+            // Add "Auto-fill Schedules" pulldownbutton to panel
+            var pulldown5 = panelSheets.Ext_AddPulldownButton("Auto-fill\nSchedules", "AVES.Commands.Cmd_DOC01_FillSchedules");
+
+            // Add buttons to "Auto-fill Schedules" pulldown
+            pulldown5.Ext_AddPushButton("By Assembly", "AVES.Commands.Cmd_DOC01a_Assembly");
+            pulldown5.Ext_AddPushButton("By Assembly A", "AVES.Commands.Cmd_DOC01b_AssemblyA");
 
             // Add button to panel
             // var buttonAddNested = panelSheets.Ext_AddPushButton("Add Nested\nto Assemblies", "AVES.Commands.Cmd_DOC08_AddNested");
