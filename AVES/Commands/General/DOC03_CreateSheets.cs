@@ -555,7 +555,7 @@ internal static class ViewUtils
     /// Extents of a world-space box expressed in the local coordinates of
     /// <paramref name="frame"/>, grown by <paramref name="padding"/> all round.
     /// </summary>
-    private static (XYZ Min, XYZ Max) LocalExtents(
+    internal static (XYZ Min, XYZ Max) LocalExtents(
         Transform frame, BoundingBoxXYZ worldBbox, double padding)
     {
         var inverse = frame.Inverse;
@@ -3987,7 +3987,7 @@ internal static class AssemblyDrawingBuilder
     // being superseded by the axis-derivation reversal; that unverified
     // step is not treated as confirmation here. RIGHT/LEFT were checked
     // correct throughout and are unchanged.
-    private static readonly IReadOnlyDictionary<string, XYZ> SideLookDirections =
+    internal static readonly IReadOnlyDictionary<string, XYZ> SideLookDirections =
         new Dictionary<string, XYZ>
         {
             ["FRONT"] = new XYZ(0, 1, 0),
@@ -4004,7 +4004,7 @@ internal static class AssemblyDrawingBuilder
     // which is the whole point of splitting it out -- an earlier version of
     // this code reused Front's vector directly, so flipping Front's sign
     // silently rotated Top/Bottom as a side effect.
-    private static readonly XYZ ScreenRightAnchorLocal = new(0, -1, 0);
+    internal static readonly XYZ ScreenRightAnchorLocal = new(0, -1, 0);
 
     // Breathing room left around the assembly in the six 2D views. Small
     // enough that the crop hugs the model, large enough that tags and

@@ -159,6 +159,9 @@
   <data name="MEK02_AddBolts" xml:space="preserve">
     <value>Select Mekano parts; bolts are placed through every pair of aligned openings, with the nut position set automatically.</value>
   </data>
+  <data name="DOC03e_Detail" xml:space="preserve">
+    <value>Select elements in the model and generate 3D and orthographic detail views of just that selection, placed on a new sheet or below an existing one.</value>
+  </data>
   <data name="MEK03_TrayArmour" xml:space="preserve">
     <value>Place one armour by hand, box-select it, pick its tray and set a spacing; the armour is replicated along the straight runs.</value>
   </data>
