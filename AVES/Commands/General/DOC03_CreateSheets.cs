@@ -12,12 +12,17 @@
 //   - Korea: Auto-generates a seven-sheet set per assembly -- 3D and part
 //     list on the first, then one orthographic view per sheet, oriented to
 //     the assembly origin and refreshed in place on a 2D-only re-run.
+//   - Detail Views: Builds 3D and orthographic detail views of a SELECTION of
+//     model elements (not whole assemblies), as user-defined sets with their
+//     own view ticks. Placed on new sheets or staged below an existing one,
+//     with a live to-scale layout preview.
 // -----------------------------------------------------------------------
 
 // Autodesk
 using Autodesk.Revit.Attributes;
 using Autodesk.Revit.DB;
 using Autodesk.Revit.UI;
+using Autodesk.Revit.UI.Selection;
 using AVES.Core;
 // File dialogs
 using Microsoft.Win32;
@@ -49,6 +54,7 @@ using Rectangle = System.Windows.Shapes.Rectangle;
 using RevitException = Autodesk.Revit.Exceptions.ApplicationException;
 using TextBox = System.Windows.Controls.TextBox;
 using Transform = Autodesk.Revit.DB.Transform;
+using Visibility = System.Windows.Visibility;
 using WpfControl = System.Windows.Controls.Control;
 
 namespace AVES.Commands;
@@ -5747,4 +5753,2222 @@ public sealed class Cmd_DOC03b_MT : IExternalCommand
             ["LEFT"] = new(centerX + spacingX, centerY, 0),
             ["TOP"] = new(centerX, centerY - spacingY, 0),
         };
+}
+
+
+// =============================================================================
+// 12. DETAIL VIEWS - LAYOUT PLANNER
+// =============================================================================
+// Pure layout maths for Cmd_DOC03e_Detail (nothing here touches the Revit API):
+// decides which sheet each view goes on, at what scale and where. A set's 2D
+// views share one scale; its 3D view auto-fits on its own. The setup window's
+// preview and the real placement both call DetailPlanner.Plan, so the diagram
+// and the sheets cannot disagree.
+
+internal enum DetailTargetMode
+{
+    /// <summary>New sheet(s); every set shares sheets, a band per set.</summary>
+    NewShared,
+
+    /// <summary>New sheet(s); each set gets a sheet of its own.</summary>
+    NewPerSet,
+
+    /// <summary>Views are staged below an existing sheet's title block.</summary>
+    ExistingSheet,
+}
+
+/// <summary>The views a set can produce, in the order they are laid out.</summary>
+internal static class DetailKeys
+{
+    public static readonly string[] Order =
+        ["3D", "TOP", "FRONT", "BACK", "LEFT", "RIGHT", "BOTTOM"];
+
+    public static readonly string[] Labels =
+        ["3D", "Top", "Front", "Back", "Left", "Right", "Bottom"];
+
+    public static bool Is3D(string key) => key == "3D";
+}
+
+/// <summary>One view's drawn size on the model, in feet (what the viewport
+/// would draw at 1:1).</summary>
+internal sealed record PlanView(string Key, double Width, double Height);
+
+internal sealed record PlanSet(string Name, IReadOnlyList<PlanView> Views);
+
+/// <summary>A view with its scale and its position inside the page, measured
+/// from the centre of the page's usable area (+Y up), in sheet feet.</summary>
+internal sealed record PlannedView(
+    int SetIndex, string Key, int Scale,
+    double CenterX, double CenterY, double DrawnWidth, double DrawnHeight);
+
+internal sealed class PlannedSheet
+{
+    /// <summary>0-based page. For an existing sheet, page 0 sits directly
+    /// below the title block and later pages stack further down.</summary>
+    public int PageIndex { get; init; }
+
+    public List<int> SetIndexes { get; } = [];
+    public List<PlannedView> Views { get; } = [];
+
+    /// <summary>First line of each set's band, for captions in the preview.</summary>
+    public List<(int SetIndex, double Top)> Bands { get; } = [];
+
+    public string Number { get; set; } = "";
+    public string Name { get; set; } = "";
+}
+
+internal sealed class DetailPlan
+{
+    public List<PlannedSheet> Sheets { get; } = [];
+    public List<string> Warnings { get; } = [];
+
+    /// <summary>Shared mode only: the sets did not fit on one sheet.</summary>
+    public bool NeedsExtraSheets { get; set; }
+}
+
+internal static class DetailPlanner
+{
+    /// <summary>Fraction of the title block's extent that views may occupy.</summary>
+    public const double UsableFraction = 0.90;
+
+    public const int MaxViewsPerLine = 4;
+    public const int LinesPerSheet = 3;
+
+    /// <summary>How much of a cell a view may fill; the rest is the gutter.</summary>
+    public const double CellFill = 0.92;
+
+    public const int ScaleWarnAbove = 100;
+
+    private const int MaxScale = 500;
+
+    public static int LineCount(int viewCount) =>
+        viewCount <= 0 ? 0 : (viewCount + MaxViewsPerLine - 1) / MaxViewsPerLine;
+
+    /// <summary>Centre of page <paramref name="page"/> relative to the centre of
+    /// an existing sheet's title block, for staged (existing sheet) layouts.</summary>
+    public static double StagingOffsetY(int page, double fullHeight, double gap) =>
+        -(page + 1) * (fullHeight + gap);
+
+    public static DetailPlan Plan(
+        IReadOnlyList<PlanSet> sets, double frameWidth, double frameHeight,
+        DetailTargetMode mode)
+    {
+        var plan = new DetailPlan();
+
+        // 1. Group the sets into pages. A set's lines never split across pages.
+        var pages = new List<List<int>>();
+        List<int>? current = null;
+        var usedLines = 0;
+
+        for (var i = 0; i < sets.Count; i++)
+        {
+            var lines = LineCount(sets[i].Views.Count);
+            if (lines == 0)
+            {
+                plan.Warnings.Add($"{sets[i].Name}: no views are ticked.");
+                continue;
+            }
+
+            var startNew = current is null
+                || mode == DetailTargetMode.NewPerSet
+                || usedLines + lines > LinesPerSheet;
+
+            if (startNew)
+            {
+                current = [];
+                pages.Add(current);
+                usedLines = 0;
+            }
+
+            current!.Add(i);
+            usedLines += lines;
+        }
+
+        plan.NeedsExtraSheets = mode == DetailTargetMode.NewShared && pages.Count > 1;
+
+        // 2. Lay each page out.
+        for (var p = 0; p < pages.Count; p++)
+        {
+            var sheet = new PlannedSheet { PageIndex = p };
+            var totalLines = pages[p].Sum(i => LineCount(sets[i].Views.Count));
+            var lineHeight = frameHeight / totalLines;
+            var lineIndex = 0;
+
+            foreach (var setIndex in pages[p])
+            {
+                sheet.SetIndexes.Add(setIndex);
+                sheet.Bands.Add((setIndex, frameHeight / 2.0 - lineHeight * lineIndex));
+
+                var views = sets[setIndex].Views;
+                var lines = LineCount(views.Count);
+                var perLine = (views.Count + lines - 1) / lines;
+                var slices = Enumerable.Range(0, lines)
+                    .Select(l => views.Skip(l * perLine).Take(perLine).ToList())
+                    .ToList();
+
+                var availHeight = lineHeight * CellFill;
+
+                // The 3D view keeps a scale of its own: it auto-fits an equal share
+                // of its line. Every 2D view of the set then shares ONE scale -- the
+                // coarsest any line needs, with the 2D views of a line splitting the
+                // width the 3D view leaves free in proportion to their size.
+                var scale3D = new Dictionary<string, int>();
+                var ratio2D = 1.0;
+
+                foreach (var slice in slices)
+                {
+                    var used3DWidth = 0.0;
+                    foreach (var view in slice.Where(v => DetailKeys.Is3D(v.Key)))
+                    {
+                        var s = PickScale(
+                            view.Width, view.Height,
+                            frameWidth / slice.Count * CellFill, availHeight);
+                        scale3D[view.Key] = s;
+                        used3DWidth += view.Width / s;
+                    }
+
+                    var twoD = slice.Where(v => !DetailKeys.Is3D(v.Key)).ToList();
+                    if (twoD.Count == 0) continue;
+
+                    var freeWidth = frameWidth * CellFill - used3DWidth;
+                    ratio2D = Math.Max(ratio2D,
+                        freeWidth > 1e-9 ? twoD.Sum(v => v.Width) / freeWidth : MaxScale);
+                    ratio2D = Math.Max(ratio2D,
+                        availHeight > 0 ? twoD.Max(v => v.Height) / availHeight : MaxScale);
+                }
+
+                var scale2D = Math.Clamp((int)Math.Ceiling(ratio2D), 1, MaxScale);
+
+                // Left to right with equal gaps, each view centred on its line.
+                foreach (var slice in slices)
+                {
+                    var drawn = slice
+                        .Select(v =>
+                        {
+                            var s = DetailKeys.Is3D(v.Key) ? scale3D[v.Key] : scale2D;
+                            return (View: v, Scale: s, W: v.Width / s, H: v.Height / s);
+                        })
+                        .ToList();
+
+                    var gapX = (frameWidth - drawn.Sum(d => d.W)) / (drawn.Count + 1);
+                    var cursor = -frameWidth / 2.0 + gapX;
+                    var cy = frameHeight / 2.0 - lineHeight * (lineIndex + 0.5);
+
+                    foreach (var d in drawn)
+                    {
+                        sheet.Views.Add(new PlannedView(
+                            setIndex, d.View.Key, d.Scale, cursor + d.W / 2.0, cy, d.W, d.H));
+                        cursor += d.W + gapX;
+                    }
+
+                    lineIndex++;
+                }
+
+                if (scale3D.Values.Any(s => s > ScaleWarnAbove))
+                {
+                    plan.Warnings.Add(
+                        $"{sets[setIndex].Name} - 3D comes out at 1:{scale3D.Values.Max()}.");
+                }
+                if (views.Any(v => !DetailKeys.Is3D(v.Key)) && scale2D > ScaleWarnAbove)
+                {
+                    plan.Warnings.Add(
+                        $"{sets[setIndex].Name} - the 2D views come out at 1:{scale2D}.");
+                }
+            }
+
+            plan.Sheets.Add(sheet);
+        }
+
+        return plan;
+    }
+
+    private static int PickScale(double w, double h, double availW, double availH)
+    {
+        if (availW <= 0 || availH <= 0) return MaxScale;
+        var s = (int)Math.Ceiling(Math.Max(w / availW, h / availH));
+        return Math.Clamp(s < 1 ? 1 : s, 1, MaxScale);
+    }
+}
+
+/// <summary>Sheet numbers and names for the sheets a plan will create.</summary>
+internal static class DetailNaming
+{
+    private static readonly System.Text.RegularExpressions.Regex TrailingDigits = new(
+        @"^(.*?)(\d+)$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /// <summary>
+    /// <paramref name="count"/> numbers starting at <paramref name="start"/>,
+    /// counting up and skipping any that are already <paramref name="used"/>,
+    /// keeping the prefix and zero padding of what the user typed.
+    /// </summary>
+    public static List<string> Allocate(string start, IEnumerable<string> used, int count)
+    {
+        var taken = new HashSet<string>(used, StringComparer.OrdinalIgnoreCase);
+        var (prefix, n, width) = Split(start);
+
+        var result = new List<string>(count);
+        while (result.Count < count)
+        {
+            var candidate = prefix + n.ToString().PadLeft(width, '0');
+            n++;
+            if (taken.Add(candidate)) result.Add(candidate);
+        }
+        return result;
+    }
+
+    private static (string Prefix, long N, int Width) Split(string? raw)
+    {
+        var s = (raw ?? "").Trim();
+        if (s.Length == 0) return ("D-", 1, 2);
+
+        var m = TrailingDigits.Match(s);
+        if (!m.Success || !long.TryParse(m.Groups[2].Value, out var n))
+            return (s + "-", 1, 2);
+
+        return (m.Groups[1].Value, n, m.Groups[2].Value.Length);
+    }
+
+    /// <summary>The default for the sheet name box.</summary>
+    public static string SuggestBaseName(IReadOnlyList<string> setNames) =>
+        setNames.Count == 1 ? setNames[0] : "Detail Views";
+
+    /// <summary>Fills in Number/Name on every new sheet of the plan.</summary>
+    public static void Apply(
+        DetailPlan plan, IReadOnlyList<string> setNames, DetailTargetMode mode,
+        string baseName, string startNumber, IEnumerable<string> usedNumbers)
+    {
+        if (mode == DetailTargetMode.ExistingSheet || plan.Sheets.Count == 0) return;
+
+        var numbers = Allocate(startNumber, usedNumbers, plan.Sheets.Count);
+        var name = string.IsNullOrWhiteSpace(baseName) ? "Detail Views" : baseName.Trim();
+
+        for (var i = 0; i < plan.Sheets.Count; i++)
+        {
+            var sheet = plan.Sheets[i];
+            sheet.Number = numbers[i];
+
+            if (mode == DetailTargetMode.NewPerSet)
+            {
+                sheet.Name = setNames.Count > 1 && sheet.SetIndexes.Count > 0
+                    ? $"{name} - {setNames[sheet.SetIndexes[0]]}"
+                    : name;
+            }
+            else
+            {
+                sheet.Name = plan.Sheets.Count > 1
+                    ? $"{name} ({i + 1}/{plan.Sheets.Count})"
+                    : name;
+            }
+        }
+    }
+}
+
+
+// =============================================================================
+// 13. DETAIL VIEWS - MODEL
+// =============================================================================
+
+/// <summary>One group of selected elements and the views wanted of it.</summary>
+internal sealed class DetailSet
+{
+    public string Name { get; set; } = "Detail A";
+
+    /// <summary>The ticked views, as DetailKeys.Order keys.</summary>
+    public HashSet<string> Views { get; } = ["3D", "TOP", "FRONT", "RIGHT"];
+
+    /// <summary>The model elements the views are framed around.</summary>
+    public List<ElementId> ElementIds { get; } = [];
+
+    /// <summary>Everything that stays visible in the set's views: the elements,
+    /// the assemblies and groups they were picked through, and the nested
+    /// components of any family instance.</summary>
+    public HashSet<ElementId> KeepIds { get; } = [];
+
+    public BoundingBoxXYZ? BoundingBox { get; private set; }
+
+    /// <summary>The assembly every element belongs to, when there is exactly
+    /// one; its axes then orient the 2D views.</summary>
+    public AssemblyInstance? ParentAssembly { get; private set; }
+
+    public Transform Frame { get; private set; } = Transform.Identity;
+
+    /// <summary>Picked elements that could not be used (no geometry, not a
+    /// model element, linked).</summary>
+    public int SkippedCount { get; private set; }
+
+    public string OrientationLabel =>
+        ParentAssembly is null ? "world axes" : $"axes of assembly {ParentAssembly.Name}";
+
+    public void SetElements(Document doc, IEnumerable<ElementId> picked)
+    {
+        ElementIds.Clear();
+        KeepIds.Clear();
+        BoundingBox = null;
+        ParentAssembly = null;
+        Frame = Transform.Identity;
+        SkippedCount = 0;
+
+        var pending = new Queue<Element>();
+        foreach (var id in picked)
+            if (doc.GetElement(id) is { } start) pending.Enqueue(start);
+
+        var seen = new HashSet<ElementId>();
+        var parents = new HashSet<ElementId>();
+        var usable = new List<Element>();
+
+        while (pending.Count > 0)
+        {
+            var e = pending.Dequeue();
+            if (!seen.Add(e.Id)) continue;
+
+            // Containers are expanded to their members; the container itself
+            // only needs to stay visible.
+            if (e is AssemblyInstance assembly)
+            {
+                KeepIds.Add(assembly.Id);
+                foreach (var m in assembly.GetMemberIds())
+                    if (doc.GetElement(m) is { } member) pending.Enqueue(member);
+                continue;
+            }
+            if (e is Group group)
+            {
+                KeepIds.Add(group.Id);
+                foreach (var m in group.GetMemberIds())
+                    if (doc.GetElement(m) is { } member) pending.Enqueue(member);
+                continue;
+            }
+
+            if (!IsUsable(e))
+            {
+                SkippedCount++;
+                continue;
+            }
+
+            ElementIds.Add(e.Id);
+            KeepIds.Add(e.Id);
+            usable.Add(e);
+            parents.Add(e.AssemblyInstanceId);
+
+            // Nested shared components are separate elements in a view and would
+            // be hidden along with everything else unless they are kept.
+            if (e is FamilyInstance instance)
+            {
+                foreach (var sub in instance.GetSubComponentIds()) KeepIds.Add(sub);
+            }
+        }
+
+        BoundingBox = GeometryUtils.GetCombinedBoundingBox(usable);
+
+        if (parents.Count == 1 && parents.First() != ElementId.InvalidElementId
+            && doc.GetElement(parents.First()) is AssemblyInstance parent)
+        {
+            ParentAssembly = parent;
+            Frame = parent.GetTransform();
+        }
+    }
+
+    internal static bool IsUsable(Element e)
+    {
+        if (e is ElementType or RevitLinkInstance) return false;
+        if (e.ViewSpecific) return false;
+        if (e.Category is not { CategoryType: CategoryType.Model }) return false;
+
+        try { return e.get_BoundingBox(null) is not null; }
+        catch { return false; }
+    }
+}
+
+/// <summary>Everything the setup window collects.</summary>
+internal sealed class DetailRequest
+{
+    public List<DetailSet> Sets { get; } = [];
+    public DetailTargetMode Mode { get; set; } = DetailTargetMode.NewShared;
+    public ViewSheet? ExistingSheet { get; set; }
+    public FamilySymbol? Titleblock { get; set; }
+    public View? V3d { get; set; }
+    public View? V2d { get; set; }
+    public string SheetName { get; set; } = "";
+
+    /// <summary>True once the user has typed their own sheet name, so the
+    /// suggestion stops overwriting it.</summary>
+    public bool SheetNameEdited { get; set; }
+
+    public string SheetNumber { get; set; } = "";
+    public double GapMm { get; set; } = 50.0;
+
+    public double GapFt => UnitUtils.ConvertToInternalUnits(GapMm, UnitTypeId.Millimeters);
+
+    /// <summary>The sets that will actually produce views, in order. Their
+    /// position in this list is the SetIndex the planner uses.</summary>
+    public List<DetailSet> PlannableSets() =>
+        Sets.Where(s => s.BoundingBox is not null && s.Views.Count > 0).ToList();
+
+    /// <summary>Why the request cannot run yet, or null when it can.</summary>
+    public string? Problem()
+    {
+        var sets = PlannableSets();
+        if (sets.Count == 0) return "Add a set with elements and at least one view ticked.";
+        if (sets.Any(s => string.IsNullOrWhiteSpace(s.Name))) return "Give every set a name.";
+
+        if (sets.Any(s => s.Views.Contains("3D")) && V3d is null) return "Pick a 3D view template.";
+        if (sets.Any(s => s.Views.Any(k => k != "3D")) && V2d is null) return "Pick a 2D view template.";
+
+        if (Mode == DetailTargetMode.ExistingSheet)
+            return ExistingSheet is null ? "Pick the existing sheet." : null;
+
+        if (Titleblock is null) return "Pick a title block.";
+        if (string.IsNullOrWhiteSpace(SheetNumber)) return "Enter a sheet number.";
+        return null;
+    }
+}
+
+internal sealed class DetailViewsSettings
+{
+    public string? TitleBlockName { get; set; }
+    public string? View3DTemplateName { get; set; }
+    public string? View2DTemplateName { get; set; }
+    public string? LastSheetNumber { get; set; }
+    public int Mode { get; set; }
+    public double GapMm { get; set; } = 50.0;
+}
+
+
+// =============================================================================
+// 14. DETAIL VIEWS - SIZING AND FRAMES
+// =============================================================================
+
+/// <summary>A sheet's title block extent: the full size and where its centre
+/// is in sheet coordinates.</summary>
+internal readonly record struct DetailFrame(double FullWidth, double FullHeight, XYZ Center)
+{
+    public double UsableWidth => FullWidth * DetailPlanner.UsableFraction;
+    public double UsableHeight => FullHeight * DetailPlanner.UsableFraction;
+}
+
+internal static class DetailFrames
+{
+    /// <summary>
+    /// Measures a title block type by putting it on a sheet that is rolled back
+    /// straight away -- the same measurement SheetFrame.Measure takes on the
+    /// real sheets, so the preview and the placement agree.
+    /// </summary>
+    public static DetailFrame? ForTitleblock(Document doc, FamilySymbol symbol)
+    {
+        using var tx = new Transaction(doc, "Measure title block");
+        tx.Start();
+        try
+        {
+            var sheet = ViewSheet.Create(doc, symbol.Id);
+            var frame = SheetFrame.Measure(doc, sheet, 1.0);
+            return new DetailFrame(frame.UsableWidth, frame.UsableHeight, frame.Center);
+        }
+        catch
+        {
+            return null;
+        }
+        finally
+        {
+            if (tx.GetStatus() == TransactionStatus.Started) tx.RollBack();
+        }
+    }
+
+    /// <summary>The title block extent of a sheet that already exists.</summary>
+    public static DetailFrame? ForSheet(Document doc, ViewSheet sheet)
+    {
+        var titleblock = new FilteredElementCollector(doc, sheet.Id)
+            .OfCategory(BuiltInCategory.OST_TitleBlocks)
+            .WhereElementIsNotElementType()
+            .FirstElement();
+
+        if (titleblock?.get_BoundingBox(sheet) is not { } bb) return null;
+
+        return new DetailFrame(
+            Math.Abs(bb.Max.X - bb.Min.X),
+            Math.Abs(bb.Max.Y - bb.Min.Y),
+            new XYZ((bb.Min.X + bb.Max.X) / 2.0, (bb.Min.Y + bb.Max.Y) / 2.0, 0));
+    }
+}
+
+internal static class DetailSizing
+{
+    /// <summary>Breathing room around the set in the 2D views; matches the
+    /// assembly drawing commands.</summary>
+    public const double CropPaddingMm = 10.0;
+
+    public static PlanSet ToPlanSet(DetailSet set, double sectionBoxPadding)
+    {
+        var views = new List<PlanView>();
+        if (set.BoundingBox is { } bb)
+        {
+            foreach (var key in DetailKeys.Order.Where(set.Views.Contains))
+            {
+                var (w, h) = DetailKeys.Is3D(key)
+                    ? Estimate3D(bb, sectionBoxPadding)
+                    : Size2D(set, bb, key);
+                views.Add(new PlanView(key, w, h));
+            }
+        }
+        return new PlanSet(set.Name, views);
+    }
+
+    /// <summary>Drawn size of a true isometric of the box, section-box padding
+    /// included. An estimate: the real 3D view is only known once it exists.</summary>
+    public static (double W, double H) Estimate3D(BoundingBoxXYZ bb, double sectionBoxPadding)
+    {
+        var (sx, sy, sz) = GeometryUtils.GetSize(bb);
+        sx += 2 * sectionBoxPadding;
+        sy += 2 * sectionBoxPadding;
+        sz += 2 * sectionBoxPadding;
+
+        return ((sx + sy) * 0.7071, 0.8165 * sz + 0.4082 * (sx + sy));
+    }
+
+    public static (double W, double H) Size2D(DetailSet set, BoundingBoxXYZ bb, string key)
+    {
+        var padding = UnitUtils.ConvertToInternalUnits(CropPaddingMm, UnitTypeId.Millimeters);
+        var (min, max) = ViewUtils.LocalExtents(ViewFrame(set, bb, key), bb, padding);
+        return (max.X - min.X, max.Y - min.Y);
+    }
+
+    /// <summary>The frame a 2D view of <paramref name="key"/> is drawn in: the
+    /// same bases the view creators use.</summary>
+    private static Transform ViewFrame(DetailSet set, BoundingBoxXYZ bb, string key)
+    {
+        XYZ Map(XYZ local) => set.Frame.OfVector(local).Normalize();
+
+        XYZ bx, by, bz;
+        if (AssemblyDrawingBuilder.SideLookDirections.TryGetValue(key, out var look))
+        {
+            bz = Map(look);
+            bx = XYZ.BasisZ.CrossProduct(bz).Normalize();
+            by = bz.CrossProduct(bx).Normalize();
+        }
+        else
+        {
+            var right = XYZ.BasisZ.CrossProduct(
+                Map(AssemblyDrawingBuilder.ScreenRightAnchorLocal)).Normalize();
+
+            bz = XYZ.BasisZ;
+            bx = key == "BOTTOM" ? right.Negate() : right;
+            by = XYZ.BasisZ.CrossProduct(bx).Normalize();
+        }
+
+        var t = Transform.Identity;
+        t.Origin = (bb.Min + bb.Max) / 2.0;
+        t.BasisX = bx;
+        t.BasisY = by;
+        t.BasisZ = bz;
+        return t;
+    }
+}
+
+/// <summary>
+/// What the setup window and the runner both need from the open document, and
+/// the one place a request is turned into a plan.
+/// </summary>
+internal sealed class DetailContext
+{
+    private readonly Dictionary<ElementId, DetailFrame?> _titleblockFrames = [];
+    private readonly Dictionary<ElementId, DetailFrame?> _sheetFrames = [];
+
+    public Document Doc { get; init; } = null!;
+    public IntPtr RevitHandle { get; init; }
+    public IReadOnlyDictionary<string, View> Templates3D { get; init; } = new Dictionary<string, View>();
+    public IReadOnlyDictionary<string, View> Templates2D { get; init; } = new Dictionary<string, View>();
+    public IReadOnlyDictionary<string, FamilySymbol> Titleblocks { get; init; } = new Dictionary<string, FamilySymbol>();
+    public IReadOnlyDictionary<string, ViewSheet> SheetsByLabel { get; init; } = new Dictionary<string, ViewSheet>();
+    public HashSet<string> UsedSheetNumbers { get; init; } = [];
+    public double SectionBoxPaddingFt { get; init; }
+
+    public DetailFrame? FrameOf(FamilySymbol symbol)
+    {
+        if (!_titleblockFrames.TryGetValue(symbol.Id, out var frame))
+        {
+            frame = DetailFrames.ForTitleblock(Doc, symbol);
+            _titleblockFrames[symbol.Id] = frame;
+        }
+        return frame;
+    }
+
+    public DetailFrame? FrameOf(ViewSheet sheet)
+    {
+        if (!_sheetFrames.TryGetValue(sheet.Id, out var frame))
+        {
+            frame = DetailFrames.ForSheet(Doc, sheet);
+            _sheetFrames[sheet.Id] = frame;
+        }
+        return frame;
+    }
+
+    /// <summary>The frame the request will be laid out in, or null while the
+    /// title block / sheet is not chosen or cannot be measured.</summary>
+    public DetailFrame? FrameFor(DetailRequest req) =>
+        req.Mode == DetailTargetMode.ExistingSheet
+            ? (req.ExistingSheet is null ? null : FrameOf(req.ExistingSheet))
+            : (req.Titleblock is null ? null : FrameOf(req.Titleblock));
+
+    /// <summary>The plan the preview shows (sizes are estimates for the 3D
+    /// views; the real run re-plans with the measured views).</summary>
+    public (DetailPlan Plan, DetailFrame Frame)? BuildPlan(DetailRequest req)
+    {
+        if (FrameFor(req) is not { } frame) return null;
+
+        var sets = req.PlannableSets();
+        var planSets = sets.Select(s => DetailSizing.ToPlanSet(s, SectionBoxPaddingFt)).ToList();
+
+        var plan = DetailPlanner.Plan(planSets, frame.UsableWidth, frame.UsableHeight, req.Mode);
+        DetailNaming.Apply(
+            plan, sets.Select(s => s.Name).ToList(), req.Mode,
+            req.SheetName, req.SheetNumber, UsedSheetNumbers);
+
+        return (plan, frame);
+    }
+}
+
+
+// =============================================================================
+// 15. DETAIL VIEWS - VIEW BUILDER
+// =============================================================================
+
+/// <summary>
+/// Creates the views for one set. Mirrors AssemblyDrawingBuilder.Build, but
+/// frames the set's elements instead of an assembly and isolates exactly those.
+/// The Front/Back/Left/Right look directions are the assembly drawing
+/// commands' own fixed convention (AssemblyDrawingBuilder.SideLookDirections),
+/// applied in the parent assembly's frame when there is one.
+/// </summary>
+internal static class DetailViewBuilder
+{
+    public static IReadOnlyDictionary<string, View> Build(
+        Document doc, DetailSet set, DetailRequest req,
+        double sectionBoxPadding, NameRegistry viewNames)
+    {
+        var bbox = set.BoundingBox
+            ?? throw new InvalidOperationException("The set has no usable elements.");
+
+        var views = new Dictionary<string, View>();
+
+        if (set.Views.Contains("3D"))
+        {
+            var vft3d = ViewUtils.Get3DViewFamilyType(doc)
+                ?? throw new InvalidOperationException(
+                    "No 3D view family type found in this project.");
+
+            var view3d = ViewUtils.CreateOrthographic3D(
+                doc, vft3d, viewNames.Reserve($"{set.Name} - 3D"),
+                req.V3d!.Id, bbox, sectionBoxPadding);
+            IsolateElementsPermanently(doc, view3d, set.KeepIds);
+            ViewUtils.SetDescription(view3d, AssemblyDrawingBuilder.ViewTitles["3D"]);
+            views["3D"] = view3d;
+        }
+
+        var keys2d = DetailKeys.Order.Where(k => !DetailKeys.Is3D(k) && set.Views.Contains(k)).ToList();
+        if (keys2d.Count == 0) return views;
+
+        XYZ Map(XYZ local) => set.Frame.OfVector(local).Normalize();
+
+        var viewPadding = UnitUtils.ConvertToInternalUnits(
+            DetailSizing.CropPaddingMm, UnitTypeId.Millimeters);
+
+        var sectionVft = ViewUtils.GetViewFamilyType(doc, ViewFamily.Section)
+            ?? throw new InvalidOperationException(
+                "No Section view family type found in this project.");
+
+        var bboxCenter = (bbox.Min + bbox.Max) / 2.0;
+        var frontRight = XYZ.BasisZ
+            .CrossProduct(Map(AssemblyDrawingBuilder.ScreenRightAnchorLocal))
+            .Normalize();
+
+        var created = new Dictionary<string, View>();
+
+        foreach (var key in keys2d)
+        {
+            if (AssemblyDrawingBuilder.SideLookDirections.TryGetValue(key, out var look))
+            {
+                created[key] = ViewUtils.CreateOrthoSection(
+                    doc, sectionVft.Id, bbox, Map(look), viewPadding);
+            }
+            else if (key == "TOP")
+            {
+                var floorPlanVft = ViewUtils.GetViewFamilyType(doc, ViewFamily.FloorPlan)
+                    ?? throw new InvalidOperationException(
+                        "No Floor Plan view family type found in this project.");
+                var level = LevelUtils.FindNearestLevel(doc, bboxCenter)
+                    ?? throw new InvalidOperationException("No levels found in this project.");
+
+                // Fit, rotate, fit -- see AssemblyDrawingBuilder.Build.
+                var top = ViewPlan.Create(doc, floorPlanVft.Id, level.Id);
+                ViewUtils.FitViewRangeToBoundingBox(top, bbox, level, viewPadding);
+                ViewUtils.FitCropBoxToBoundingBox(top, bbox, viewPadding);
+                ViewUtils.RotateCropToRightDirection(doc, top, frontRight, bboxCenter);
+                ViewUtils.FitCropBoxToBoundingBox(top, bbox, viewPadding);
+                created[key] = top;
+            }
+            else if (key == "BOTTOM")
+            {
+                created[key] = ViewUtils.CreateUpwardSection(
+                    doc, sectionVft.Id, bbox, frontRight, viewPadding);
+            }
+        }
+
+        foreach (var (key, view) in created)
+        {
+            view.Name = viewNames.Reserve($"{set.Name} - {key}");
+            try { view.ViewTemplateId = req.V2d!.Id; }
+            catch { /* template not valid for this view type; leave the view without one */ }
+
+            IsolateElementsPermanently(doc, view, set.KeepIds);
+
+            if (AssemblyDrawingBuilder.ViewTitles.TryGetValue(key, out var title))
+                ViewUtils.SetDescription(view, title);
+        }
+
+        foreach (var key in keys2d)
+            if (created.TryGetValue(key, out var view)) views[key] = view;
+
+        return views;
+    }
+
+    /// <summary>
+    /// Permanently hides everything in <paramref name="view"/> that is not in
+    /// <paramref name="keep"/>. Same method as ViewUtils.IsolateAssemblyPermanently,
+    /// with the keep-set supplied by the caller.
+    /// </summary>
+    private static void IsolateElementsPermanently(
+        Document doc, View view, IReadOnlySet<ElementId> keep)
+    {
+        // A view-based collector only sees what the view has resolved, and these
+        // views were created moments ago in this same transaction.
+        doc.Regenerate();
+
+        var toHide = new FilteredElementCollector(doc, view.Id)
+            .WhereElementIsNotElementType()
+            .Where(e => e.Category is not null
+                        && !keep.Contains(e.Id)
+                        && e.CanBeHidden(view))
+            .Select(e => e.Id)
+            .ToList();
+
+        if (toHide.Count == 0) return;
+
+        try
+        {
+            view.HideElements(toHide);
+        }
+        catch
+        {
+            // Bulk hide is all-or-nothing; fall back to one at a time so a
+            // single stubborn element does not cost the whole isolation.
+            foreach (var id in toHide)
+            {
+                try { view.HideElements(new List<ElementId> { id }); }
+                catch { /* element refuses to hide in this view; skip it */ }
+            }
+        }
+    }
+
+    /// <summary>The size a built view will draw at 1:1, for re-planning with
+    /// real numbers once the views exist.</summary>
+    public static (double W, double H) MeasuredSize(
+        DetailSet set, string key, View view, double sectionBoxPadding)
+    {
+        if (DetailKeys.Is3D(key))
+            return DetailSizing.Estimate3D(set.BoundingBox!, sectionBoxPadding);
+
+        var crop = view.CropBox;
+        return (Math.Abs(crop.Max.X - crop.Min.X), Math.Abs(crop.Max.Y - crop.Min.Y));
+    }
+}
+
+
+// =============================================================================
+// 16. DETAIL VIEWS - SELECTION
+// =============================================================================
+
+internal sealed class DetailSelectionFilter : ISelectionFilter
+{
+    public bool AllowElement(Element elem) =>
+        elem is AssemblyInstance || elem is Group || DetailSet.IsUsable(elem);
+
+    public bool AllowReference(Reference reference, XYZ position) => false;
+}
+
+
+
+
+// =============================================================================
+// 17. DETAIL VIEWS - SETUP WINDOW
+// =============================================================================
+// Sets and their view ticks, templates, title block, target and a live to-scale
+// preview. Every change re-runs DetailContext.BuildPlan and repaints from it --
+// the same plan the real placement uses. Adding or re-picking a set closes the
+// window with an Outcome; the command picks in the model and re-opens it on the
+// same DetailRequest.
+
+internal enum DetailWindowOutcome
+{
+    Cancel,
+    Run,
+    AddSet,
+    Repick,
+}
+
+internal sealed class DetailSetupWindow : Window
+{
+    private const string Placeholder = "Not selected";
+    private const double CanvasW = 640;
+    private const double CanvasH = 440;
+    private const double CanvasPad = 24;
+
+    private readonly DetailRequest _req;
+    private readonly DetailContext _ctx;
+
+    private readonly StackPanel _setsPanel = new();
+    private readonly Button _pick3d;
+    private readonly Button _pick2d;
+    private readonly Button _pickTitleblock;
+    private readonly Button _pickSheet;
+    private readonly RadioButton _rbShared;
+    private readonly RadioButton _rbPerSet;
+    private readonly RadioButton _rbExisting;
+    private readonly TextBox _nameBox;
+    private readonly TextBox _numberBox;
+    private readonly TextBox _gapBox;
+    private readonly StackPanel _newSheetPanel = new();
+    private readonly StackPanel _existingPanel = new();
+    private readonly TextBlock _problemText;
+    private readonly Button _runBtn;
+    private readonly Border _previewHost;
+    private readonly Border _banner;
+    private readonly TextBlock _bannerText;
+    private readonly StackPanel _pager;
+    private readonly TextBlock _pageLabel;
+
+    private int _page;
+    private bool _loading;
+
+    public DetailWindowOutcome Outcome { get; private set; } = DetailWindowOutcome.Cancel;
+    public int RepickIndex { get; private set; }
+
+    public DetailSetupWindow(DetailRequest req, DetailContext ctx)
+    {
+        _req = req;
+        _ctx = ctx;
+
+        Title = "Detail Views";
+        Width = 1220;
+        MinWidth = 980;
+        SizeToContent = SizeToContent.Height;
+        MaxHeight = SystemParameters.WorkArea.Height * 0.92;
+        WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        ResizeMode = ResizeMode.CanResize;
+        ShowInTaskbar = false;
+        UseLayoutRounding = true;
+        SnapsToDevicePixels = true;
+        FontFamily = AvTokens.Ui;
+        Background = AvTokens.Br(AvTokens.Surface);
+
+        if (ctx.RevitHandle != IntPtr.Zero)
+            _ = new WindowInteropHelper(this) { Owner = ctx.RevitHandle };
+
+        var root = new DockPanel();
+
+        var header = AvControls.HeaderStrip("Detail Views");
+        DockPanel.SetDock(header, Dock.Top);
+        root.Children.Add(header);
+
+        // ── Footer ────────────────────────────────────────────────────────────
+        _runBtn = AvControls.PrimaryButtonHoverLoaded("Run");
+        _runBtn.IsDefault = true;
+        _runBtn.Click += (_, _) => Finish(DetailWindowOutcome.Run);
+
+        var cancelBtn = AvControls.GhostButtonHoverLoaded("Cancel");
+        cancelBtn.IsCancel = true;
+        cancelBtn.Margin = new Thickness(0, 0, 8, 0);
+        cancelBtn.Click += (_, _) => Finish(DetailWindowOutcome.Cancel);
+
+        _problemText = new TextBlock
+        {
+            FontSize = 12,
+            Foreground = AvTokens.Br(AvTokens.TextDim),
+            VerticalAlignment = VerticalAlignment.Center,
+            TextWrapping = TextWrapping.Wrap,
+        };
+
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal };
+        buttons.Children.Add(cancelBtn);
+        buttons.Children.Add(_runBtn);
+
+        var footerGrid = new Grid();
+        footerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        footerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        Grid.SetColumn(_problemText, 0);
+        Grid.SetColumn(buttons, 1);
+        footerGrid.Children.Add(_problemText);
+        footerGrid.Children.Add(buttons);
+
+        var footer = new Border
+        {
+            Background = AvTokens.Br(AvTokens.Surface2),
+            BorderBrush = AvTokens.Br(AvTokens.Border),
+            BorderThickness = new Thickness(0, 1, 0, 0),
+            Padding = new Thickness(20, 14, 20, 14),
+            Child = footerGrid,
+        };
+        DockPanel.SetDock(footer, Dock.Bottom);
+        root.Children.Add(footer);
+
+        // ── Body ──────────────────────────────────────────────────────────────
+        var columns = new Grid { Margin = new Thickness(20, 16, 20, 16) };
+        columns.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(510) });
+        columns.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(24) });
+        columns.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        // Left column
+        var left = new StackPanel();
+
+        left.Children.Add(AvControls.FieldLabel(1, "Sets"));
+        left.Children.Add(_setsPanel);
+
+        var addSet = AvControls.SecondaryBtn("+ Add set", () => Finish(DetailWindowOutcome.AddSet));
+        addSet.HorizontalAlignment = HorizontalAlignment.Left;
+        addSet.Margin = new Thickness(0, 2, 0, 16);
+        left.Children.Add(addSet);
+
+        _pick3d = AvControls.PickerButton(Placeholder, showChevron: true);
+        _pick3d.Click += (_, _) => PickTemplate(_ctx.Templates3D, "Select 3D View Template", _pick3d, v => _req.V3d = v);
+        AddStep(left, 2, "3D View Template", _pick3d);
+
+        _pick2d = AvControls.PickerButton(Placeholder, showChevron: true);
+        _pick2d.Click += (_, _) => PickTemplate(_ctx.Templates2D, "Select 2D View Template", _pick2d, v => _req.V2d = v);
+        AddStep(left, 3, "2D View Template", _pick2d);
+
+        left.Children.Add(AvControls.FieldLabel(4, "Place on"));
+        _rbShared = NewRadio("New sheet - all sets together", DetailTargetMode.NewShared);
+        _rbPerSet = NewRadio("New sheet per set", DetailTargetMode.NewPerSet);
+        _rbExisting = NewRadio("Existing sheet (views are placed below its frame)", DetailTargetMode.ExistingSheet);
+        left.Children.Add(_rbShared);
+        left.Children.Add(_rbPerSet);
+        left.Children.Add(_rbExisting);
+        left.Children.Add(new Border { Height = 14 });
+
+        // New-sheet fields
+        _pickTitleblock = AvControls.PickerButton(Placeholder, showChevron: true);
+        _pickTitleblock.Click += (_, _) => PickTitleblock();
+        _newSheetPanel.Children.Add(AvControls.FieldLabel(5, "Title Block"));
+        _pickTitleblock.Margin = new Thickness(0, 0, 0, 16);
+        _newSheetPanel.Children.Add(_pickTitleblock);
+
+        _newSheetPanel.Children.Add(AvControls.FieldLabel(6, "Sheet name and number"));
+        _nameBox = NewTextBox();
+        _nameBox.TextChanged += (_, _) => OnNameChanged();
+        _numberBox = NewTextBox();
+        _numberBox.TextChanged += (_, _) => OnNumberChanged();
+
+        var nameRow = new Grid();
+        nameRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        nameRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(10) });
+        nameRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(130) });
+        Grid.SetColumn(_nameBox, 0);
+        Grid.SetColumn(_numberBox, 2);
+        nameRow.Children.Add(_nameBox);
+        nameRow.Children.Add(_numberBox);
+        _newSheetPanel.Children.Add(nameRow);
+        _newSheetPanel.Children.Add(Hint(
+            "The name is a suggestion - edit it freely. Numbers count up from the one " +
+            "entered and skip any already in the project."));
+        left.Children.Add(_newSheetPanel);
+
+        // Existing-sheet fields
+        _pickSheet = AvControls.PickerButton(Placeholder, showChevron: true);
+        _pickSheet.Click += (_, _) => PickSheet();
+        _existingPanel.Children.Add(AvControls.FieldLabel(5, "Existing sheet"));
+        _pickSheet.Margin = new Thickness(0, 0, 0, 16);
+        _existingPanel.Children.Add(_pickSheet);
+
+        _existingPanel.Children.Add(AvControls.FieldLabel(6, "Gap below the title block (mm)"));
+        _gapBox = NewTextBox();
+        _gapBox.Width = 130;
+        _gapBox.HorizontalAlignment = HorizontalAlignment.Left;
+        _gapBox.TextChanged += (_, _) => OnGapChanged();
+        _existingPanel.Children.Add(_gapBox);
+        _existingPanel.Children.Add(Hint(
+            "The views are laid out as they would be on a blank sheet and placed " +
+            "below the frame. Move them into the free space by hand."));
+        left.Children.Add(_existingPanel);
+
+        var leftScroll = new ScrollViewer
+        {
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            Content = left,
+        };
+        Grid.SetColumn(leftScroll, 0);
+        columns.Children.Add(leftScroll);
+
+        // Right column - preview
+        var right = new DockPanel();
+
+        _pageLabel = new TextBlock
+        {
+            FontSize = 12,
+            Foreground = AvTokens.Br(AvTokens.TextDim),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(8, 0, 8, 0),
+        };
+        var prev = AvControls.SecondaryBtn("◀", () => { _page--; RefreshPreview(); });
+        var next = AvControls.SecondaryBtn("▶", () => { _page++; RefreshPreview(); });
+        _pager = new StackPanel { Orientation = Orientation.Horizontal, Visibility = Visibility.Collapsed };
+        _pager.Children.Add(prev);
+        _pager.Children.Add(_pageLabel);
+        _pager.Children.Add(next);
+
+        var previewTitle = new TextBlock
+        {
+            Text = "PREVIEW",
+            FontSize = 11,
+            FontWeight = FontWeights.Bold,
+            Foreground = AvTokens.Br(AvTokens.TextFaint),
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var previewHeader = new DockPanel { Margin = new Thickness(0, 0, 0, 8) };
+        DockPanel.SetDock(_pager, Dock.Right);
+        previewHeader.Children.Add(_pager);
+        previewHeader.Children.Add(previewTitle);
+        DockPanel.SetDock(previewHeader, Dock.Top);
+        right.Children.Add(previewHeader);
+
+        _bannerText = new TextBlock
+        {
+            FontSize = 12,
+            Foreground = AvTokens.Br(AvTokens.WarnFg),
+            TextWrapping = TextWrapping.Wrap,
+        };
+        _banner = new Border
+        {
+            Background = AvTokens.Br(AvTokens.WarnBg),
+            CornerRadius = new CornerRadius(5),
+            Padding = new Thickness(10, 8, 10, 8),
+            Margin = new Thickness(0, 0, 0, 8),
+            Visibility = Visibility.Collapsed,
+            Child = _bannerText,
+        };
+        DockPanel.SetDock(_banner, Dock.Top);
+        right.Children.Add(_banner);
+
+        _previewHost = new Border
+        {
+            Background = AvTokens.Br(AvTokens.Zebra),
+            BorderBrush = AvTokens.Br(AvTokens.Border),
+            BorderThickness = new Thickness(1),
+            MinHeight = 440,
+        };
+        right.Children.Add(_previewHost);
+
+        Grid.SetColumn(right, 2);
+        columns.Children.Add(right);
+
+        root.Children.Add(columns);
+        Content = root;
+
+        // ── Initial state ─────────────────────────────────────────────────────
+        _loading = true;
+        _numberBox.Text = _req.SheetNumber;
+        _nameBox.Text = _req.SheetName;
+        _gapBox.Text = _req.GapMm.ToString("0.##", CultureInfo.InvariantCulture);
+        _loading = false;
+
+        AvControls.SetPickerValue(_pick3d, _req.V3d?.Name, Placeholder);
+        AvControls.SetPickerValue(_pick2d, _req.V2d?.Name, Placeholder);
+        AvControls.SetPickerValue(_pickTitleblock,
+            _req.Titleblock is null ? null : TitleblockUtils.DisplayName(_req.Titleblock), Placeholder);
+        AvControls.SetPickerValue(_pickSheet,
+            _req.ExistingSheet is null ? null : $"{_req.ExistingSheet.SheetNumber} - {_req.ExistingSheet.Name}",
+            Placeholder);
+
+        _loading = true;
+        _rbShared.IsChecked = _req.Mode == DetailTargetMode.NewShared;
+        _rbPerSet.IsChecked = _req.Mode == DetailTargetMode.NewPerSet;
+        _rbExisting.IsChecked = _req.Mode == DetailTargetMode.ExistingSheet;
+        _loading = false;
+
+        RebuildSets();
+        UpdateTargetPanels();
+        RefreshAll();
+    }
+
+    // ── Plumbing ─────────────────────────────────────────────────────────────
+
+    private void Finish(DetailWindowOutcome outcome)
+    {
+        Outcome = outcome;
+        DialogResult = outcome == DetailWindowOutcome.Run;
+        Close();
+    }
+
+    private void RefreshAll()
+    {
+        UpdateSuggestedName();
+        RefreshPreview();
+        UpdateRunState();
+    }
+
+    private void UpdateRunState()
+    {
+        var problem = _req.Problem();
+        _runBtn.IsEnabled = problem is null;
+        _problemText.Text = problem ?? "";
+    }
+
+    private void UpdateTargetPanels()
+    {
+        var existing = _req.Mode == DetailTargetMode.ExistingSheet;
+        _newSheetPanel.Visibility = existing ? Visibility.Collapsed : Visibility.Visible;
+        _existingPanel.Visibility = existing ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void UpdateSuggestedName()
+    {
+        if (_req.SheetNameEdited) return;
+
+        var names = _req.PlannableSets().Select(s => s.Name).ToList();
+        var suggestion = names.Count == 0 ? "Detail Views" : DetailNaming.SuggestBaseName(names);
+
+        _req.SheetName = suggestion;
+        _loading = true;
+        _nameBox.Text = suggestion;
+        _loading = false;
+    }
+
+    private void OnNameChanged()
+    {
+        if (_loading) return;
+
+        _req.SheetName = _nameBox.Text;
+        _req.SheetNameEdited = !string.IsNullOrWhiteSpace(_nameBox.Text);
+        RefreshPreview();
+    }
+
+    private void OnNumberChanged()
+    {
+        if (_loading) return;
+
+        _req.SheetNumber = _numberBox.Text.Trim();
+        RefreshPreview();
+        UpdateRunState();
+    }
+
+    private void OnGapChanged()
+    {
+        if (_loading) return;
+
+        if (double.TryParse(_gapBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var mm)
+            || double.TryParse(_gapBox.Text, NumberStyles.Float, CultureInfo.CurrentCulture, out mm))
+        {
+            _req.GapMm = Math.Max(0, mm);
+            RefreshPreview();
+        }
+    }
+
+    private void PickTemplate(
+        IReadOnlyDictionary<string, View> source, string title, Button box, Action<View> assign)
+    {
+        var picked = TemplatePicker.Pick(source, title, _ctx.RevitHandle);
+        if (picked is null) return;
+
+        assign(picked);
+        AvControls.SetPickerValue(box, picked.Name, Placeholder);
+        RefreshAll();
+    }
+
+    private void PickTitleblock()
+    {
+        var picked = TemplatePicker.PickName(_ctx.Titleblocks.Keys, "Select Title Block", _ctx.RevitHandle);
+        if (picked is null) return;
+
+        _req.Titleblock = _ctx.Titleblocks[picked];
+        AvControls.SetPickerValue(_pickTitleblock, picked, Placeholder);
+        RefreshAll();
+    }
+
+    private void PickSheet()
+    {
+        var picked = TemplatePicker.PickName(_ctx.SheetsByLabel.Keys, "Select Sheet", _ctx.RevitHandle);
+        if (picked is null) return;
+
+        var sheet = _ctx.SheetsByLabel[picked];
+        if (_ctx.FrameOf(sheet) is null)
+        {
+            AvControls.ShowAlert("Detail Views",
+                "That sheet has no title block, so there is no frame to place the views below.\n\n" +
+                "Pick another sheet.", AlertSeverity.Warning);
+            return;
+        }
+
+        _req.ExistingSheet = sheet;
+        AvControls.SetPickerValue(_pickSheet, picked, Placeholder);
+        RefreshAll();
+    }
+
+    // ── Sets ─────────────────────────────────────────────────────────────────
+
+    private void RebuildSets()
+    {
+        _setsPanel.Children.Clear();
+
+        if (_req.Sets.Count == 0)
+        {
+            _setsPanel.Children.Add(Hint(
+                "No sets yet. Select elements in the model, then click Add set."));
+            return;
+        }
+
+        for (var i = 0; i < _req.Sets.Count; i++)
+            _setsPanel.Children.Add(BuildSetCard(i, _req.Sets[i]));
+    }
+
+    private Border BuildSetCard(int index, DetailSet set)
+    {
+        var nameBox = NewTextBox();
+        nameBox.Text = set.Name;
+        nameBox.Width = 150;
+        nameBox.FontWeight = FontWeights.SemiBold;
+        nameBox.TextChanged += (_, _) =>
+        {
+            set.Name = nameBox.Text;
+            RefreshAll();
+        };
+
+        var count = set.ElementIds.Count;
+        var info = new TextBlock
+        {
+            Text = $"{count} element{(count == 1 ? "" : "s")} · {set.OrientationLabel}",
+            FontSize = 11,
+            Foreground = AvTokens.Br(AvTokens.TextFaint),
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            Margin = new Thickness(10, 0, 8, 0),
+        };
+
+        var repick = AvControls.SecondaryBtn("Re-pick", () =>
+        {
+            RepickIndex = index;
+            Finish(DetailWindowOutcome.Repick);
+        });
+        repick.Margin = new Thickness(0, 0, 6, 0);
+
+        var remove = AvControls.SecondaryBtn("✕", () =>
+        {
+            _req.Sets.RemoveAt(index);
+            RebuildSets();
+            RefreshAll();
+        });
+
+        var top = new Grid();
+        top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        top.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        Grid.SetColumn(nameBox, 0);
+        Grid.SetColumn(info, 1);
+        Grid.SetColumn(repick, 2);
+        Grid.SetColumn(remove, 3);
+        top.Children.Add(nameBox);
+        top.Children.Add(info);
+        top.Children.Add(repick);
+        top.Children.Add(remove);
+
+        // One row: a StackPanel never wraps, and the column is wide enough for all seven.
+        var ticks = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Margin = new Thickness(0, 10, 0, 2),
+        };
+        for (var k = 0; k < DetailKeys.Order.Length; k++)
+        {
+            var key = DetailKeys.Order[k];
+            var box = new CheckBox
+            {
+                Content = DetailKeys.Labels[k],
+                IsChecked = set.Views.Contains(key),
+                FontSize = 12,
+                Foreground = AvTokens.Br(AvTokens.Text),
+                Margin = new Thickness(0, 0, 12, 0),
+                VerticalContentAlignment = VerticalAlignment.Center,
+            };
+            if (DetailControlStyles.Check() is { } checkTemplate) box.Template = checkTemplate;
+            box.Checked += (_, _) => { set.Views.Add(key); RefreshAll(); };
+            box.Unchecked += (_, _) => { set.Views.Remove(key); RefreshAll(); };
+            ticks.Children.Add(box);
+        }
+
+        var body = new StackPanel();
+        body.Children.Add(top);
+        body.Children.Add(ticks);
+
+        if (set.SkippedCount > 0)
+        {
+            body.Children.Add(new TextBlock
+            {
+                Text = $"{set.SkippedCount} picked element{(set.SkippedCount == 1 ? "" : "s")} " +
+                       "skipped (no geometry or not a model element).",
+                FontSize = 11,
+                Foreground = AvTokens.Br(AvTokens.WarnFg),
+                Margin = new Thickness(0, 4, 0, 0),
+            });
+        }
+
+        return new Border
+        {
+            Background = AvTokens.Br(AvTokens.Surface2),
+            BorderBrush = AvTokens.Br(AvTokens.Border),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(6),
+            Padding = new Thickness(10),
+            Margin = new Thickness(0, 0, 0, 8),
+            Child = body,
+        };
+    }
+
+    // ── Preview ──────────────────────────────────────────────────────────────
+
+    private (DetailPlan Plan, DetailFrame Frame)? SafeBuildPlan()
+    {
+        try { return _ctx.BuildPlan(_req); }
+        catch { return null; }
+    }
+
+    private void ShowPreviewMessage(string text)
+    {
+        _pager.Visibility = Visibility.Collapsed;
+        _banner.Visibility = Visibility.Collapsed;
+        _previewHost.Child = new TextBlock
+        {
+            Text = text,
+            FontSize = 13,
+            Foreground = AvTokens.Br(AvTokens.TextFaint),
+            TextWrapping = TextWrapping.Wrap,
+            TextAlignment = TextAlignment.Center,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            MaxWidth = 380,
+        };
+    }
+
+    private void RefreshPreview()
+    {
+        var existing = _req.Mode == DetailTargetMode.ExistingSheet;
+
+        if (_req.PlannableSets().Count == 0)
+        {
+            ShowPreviewMessage("Add a set and tick at least one view to see the layout.");
+            return;
+        }
+
+        if (SafeBuildPlan() is not { } built)
+        {
+            ShowPreviewMessage(existing
+                ? "Pick an existing sheet to see the layout."
+                : "Pick a title block to see the layout.");
+            return;
+        }
+
+        var (plan, frame) = built;
+
+        // Pager - one sheet at a time for new sheets; an existing sheet shows
+        // all of its staged pages at once.
+        var multi = !existing && plan.Sheets.Count > 1;
+        _page = Math.Clamp(_page, 0, Math.Max(0, plan.Sheets.Count - 1));
+        _pager.Visibility = multi ? Visibility.Visible : Visibility.Collapsed;
+        _pageLabel.Text = $"{_page + 1} / {plan.Sheets.Count}";
+
+        // Notes
+        var notes = new List<string>(plan.Warnings);
+        if (plan.NeedsExtraSheets)
+        {
+            notes.Add($"These sets need {plan.Sheets.Count} sheets. You will be asked whether to " +
+                      "add extra sheets, or you can go back and untick views.");
+        }
+        _bannerText.Text = string.Join("\n", notes);
+        _banner.Visibility = notes.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+
+        _previewHost.Child = new Viewbox
+        {
+            Stretch = Stretch.Uniform,
+            Margin = new Thickness(8),
+            Child = DrawPlan(plan, frame, existing),
+        };
+    }
+
+    private LayoutPreviewCanvas DrawPlan(DetailPlan plan, DetailFrame frame, bool existing)
+    {
+        var canvas = new LayoutPreviewCanvas { Width = CanvasW, Height = CanvasH };
+        var sets = _req.PlannableSets();
+        var gap = _req.GapFt;
+
+        var contentW = frame.FullWidth;
+        var contentH = existing
+            ? frame.FullHeight + plan.Sheets.Count * (gap + frame.FullHeight)
+            : frame.FullHeight;
+
+        var px = Math.Min(
+            (CanvasW - 2 * CanvasPad) / contentW,
+            (CanvasH - 2 * CanvasPad) / contentH);
+
+        var centreX = CanvasW / 2.0;
+        var sheetW = frame.FullWidth * px;
+        var sheetH = frame.FullHeight * px;
+        var sheetCentreY = existing
+            ? (CanvasH - contentH * px) / 2.0 + sheetH / 2.0
+            : CanvasH / 2.0;
+
+        string sheetLabel;
+        if (existing)
+        {
+            sheetLabel = _req.ExistingSheet is null
+                ? "Existing sheet"
+                : $"{_req.ExistingSheet.SheetNumber} · {_req.ExistingSheet.Name}";
+        }
+        else
+        {
+            sheetLabel = plan.Sheets.Count > 0
+                ? $"{plan.Sheets[_page].Number} · {plan.Sheets[_page].Name}"
+                : "New sheet";
+        }
+
+        canvas.DrawSheetOutline(
+            centreX - sheetW / 2.0, sheetCentreY - sheetH / 2.0, sheetW, sheetH, sheetLabel);
+
+        var accent = AvTokens.Br(AvTokens.AccentDeep);
+
+        foreach (var page in plan.Sheets)
+        {
+            if (!existing && page.PageIndex != _page) continue;
+
+            var pageCentreY = existing
+                ? sheetCentreY - DetailPlanner.StagingOffsetY(
+                    page.PageIndex, frame.FullHeight, gap) * px
+                : sheetCentreY;
+
+            if (existing)
+            {
+                var staging = new Rectangle
+                {
+                    Width = sheetW,
+                    Height = sheetH,
+                    Stroke = AvTokens.Br(AvTokens.BorderStrong),
+                    StrokeThickness = 1,
+                    StrokeDashArray = new DoubleCollection { 4, 3 },
+                };
+                Canvas.SetLeft(staging, centreX - sheetW / 2.0);
+                Canvas.SetTop(staging, pageCentreY - sheetH / 2.0);
+                canvas.Children.Add(staging);
+
+                canvas.DrawCaption(
+                    "Placed here - move into the sheet above",
+                    centreX - sheetW / 2.0 + 4, pageCentreY - sheetH / 2.0 + 2);
+            }
+
+            foreach (var pv in page.Views)
+            {
+                var is3d = DetailKeys.Is3D(pv.Key);
+                canvas.DrawElement(
+                    centreX + pv.CenterX * px,
+                    pageCentreY - pv.CenterY * px,
+                    pv.DrawnWidth * px,
+                    pv.DrawnHeight * px,
+                    is3d ? LayoutPreviewCanvas.View3DFill : LayoutPreviewCanvas.View2DFill,
+                    is3d ? LayoutPreviewCanvas.View3DStroke : LayoutPreviewCanvas.View2DStroke,
+                    $"{pv.Key} 1:{pv.Scale}");
+            }
+
+            foreach (var (setIndex, top) in page.Bands)
+            {
+                canvas.DrawCaption(
+                    sets[setIndex].Name,
+                    centreX - frame.UsableWidth * px / 2.0 + 3,
+                    pageCentreY - top * px + 1,
+                    accent);
+            }
+        }
+
+        return canvas;
+    }
+
+    // ── Small builders ───────────────────────────────────────────────────────
+
+    private RadioButton NewRadio(string text, DetailTargetMode mode)
+    {
+        var rb = new RadioButton
+        {
+            Content = text,
+            GroupName = "DetailTarget",
+            FontSize = 12.5,
+            Foreground = AvTokens.Br(AvTokens.Text),
+            Margin = new Thickness(0, 0, 0, 8),
+        };
+        if (DetailControlStyles.Radio() is { } radioTemplate) rb.Template = radioTemplate;
+        rb.Checked += (_, _) =>
+        {
+            if (_loading) return;
+
+            _req.Mode = mode;
+            _page = 0;
+            UpdateTargetPanels();
+            RefreshAll();
+        };
+        return rb;
+    }
+
+    private static TextBox NewTextBox() => new()
+    {
+        FontFamily = AvTokens.Ui,
+        FontSize = 13,
+        Foreground = AvTokens.Br(AvTokens.Text),
+        Background = AvTokens.Br(AvTokens.Surface2),
+        BorderBrush = AvTokens.Br(AvTokens.BorderStrong),
+        BorderThickness = new Thickness(1),
+        Padding = new Thickness(8, 0, 8, 0),
+        Height = 34,
+        VerticalContentAlignment = VerticalAlignment.Center,
+    };
+
+    private static TextBlock Hint(string text) => new()
+    {
+        Text = text,
+        FontSize = 11,
+        Foreground = AvTokens.Br(AvTokens.TextFaint),
+        TextWrapping = TextWrapping.Wrap,
+        Margin = new Thickness(0, 6, 0, 4),
+    };
+
+    private static void AddStep(StackPanel stack, int step, string title, Button box)
+    {
+        stack.Children.Add(AvControls.FieldLabel(step, title));
+        box.Margin = new Thickness(0, 0, 0, 16);
+        stack.Children.Add(box);
+    }
+}
+
+
+// =============================================================================
+// Brand-coloured radio buttons and tick boxes
+// =============================================================================
+
+/// <summary>
+/// Templates that give the window's radio buttons and tick boxes the brand red
+/// when selected, drawn like AvControls.CheckRow's box (17 px, white tick on an
+/// Accent fill). A template that fails to parse yields null and the control
+/// keeps its default look rather than stopping the window opening.
+/// </summary>
+internal static class DetailControlStyles
+{
+    private const string Ns =
+        "xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' " +
+        "xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'";
+
+    private static readonly Lazy<ControlTemplate?> RadioTemplate = new(() => Parse(
+        $@"<ControlTemplate {Ns} TargetType='RadioButton'>
+  <StackPanel x:Name='Root' Orientation='Horizontal' Background='Transparent' Cursor='Hand'>
+    <Grid Width='17' Height='17' VerticalAlignment='Center'>
+      <Ellipse x:Name='Ring' Stroke='{AvTokens.BorderStrong}' StrokeThickness='1.5' Fill='{AvTokens.Surface}'/>
+      <Ellipse x:Name='Dot' Width='9' Height='9' Fill='{AvTokens.Accent}' Visibility='Hidden'/>
+    </Grid>
+    <ContentPresenter Margin='9,0,0,0' VerticalAlignment='Center' RecognizesAccessKey='True'/>
+  </StackPanel>
+  <ControlTemplate.Triggers>
+    <Trigger Property='IsMouseOver' Value='True'>
+      <Setter TargetName='Ring' Property='Stroke' Value='{AvTokens.Accent}'/>
+    </Trigger>
+    <Trigger Property='IsChecked' Value='True'>
+      <Setter TargetName='Ring' Property='Stroke' Value='{AvTokens.Accent}'/>
+      <Setter TargetName='Dot' Property='Visibility' Value='Visible'/>
+    </Trigger>
+    <Trigger Property='IsEnabled' Value='False'>
+      <Setter TargetName='Root' Property='Opacity' Value='0.5'/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>"));
+
+    private static readonly Lazy<ControlTemplate?> CheckTemplate = new(() => Parse(
+        $@"<ControlTemplate {Ns} TargetType='CheckBox'>
+  <StackPanel x:Name='Root' Orientation='Horizontal' Background='Transparent' Cursor='Hand'>
+    <Border x:Name='Box' Width='17' Height='17' CornerRadius='4' BorderThickness='1.5'
+            BorderBrush='{AvTokens.BorderStrong}' Background='{AvTokens.Surface}' VerticalAlignment='Center'>
+      <TextBlock x:Name='Mark' Text='✓' FontSize='11' FontWeight='Bold' Foreground='White'
+                 HorizontalAlignment='Center' VerticalAlignment='Center' Visibility='Hidden'/>
+    </Border>
+    <ContentPresenter Margin='8,0,0,0' VerticalAlignment='Center' RecognizesAccessKey='True'/>
+  </StackPanel>
+  <ControlTemplate.Triggers>
+    <Trigger Property='IsMouseOver' Value='True'>
+      <Setter TargetName='Box' Property='BorderBrush' Value='{AvTokens.Accent}'/>
+    </Trigger>
+    <Trigger Property='IsChecked' Value='True'>
+      <Setter TargetName='Box' Property='Background' Value='{AvTokens.Accent}'/>
+      <Setter TargetName='Box' Property='BorderBrush' Value='{AvTokens.Accent}'/>
+      <Setter TargetName='Mark' Property='Visibility' Value='Visible'/>
+      <Setter TargetName='Root' Property='TextElement.Foreground' Value='{AvTokens.Accent}'/>
+      <Setter TargetName='Root' Property='TextElement.FontWeight' Value='SemiBold'/>
+    </Trigger>
+    <Trigger Property='IsEnabled' Value='False'>
+      <Setter TargetName='Root' Property='Opacity' Value='0.5'/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>"));
+
+    public static ControlTemplate? Radio() => RadioTemplate.Value;
+
+    public static ControlTemplate? Check() => CheckTemplate.Value;
+
+    private static ControlTemplate? Parse(string xaml)
+    {
+        try { return (ControlTemplate)System.Windows.Markup.XamlReader.Parse(xaml); }
+        catch { return null; }
+    }
+}
+
+
+// =============================================================================
+// Extra-sheets prompt
+// =============================================================================
+
+internal static class DetailPrompt
+{
+    /// <summary>True to add extra sheets, false to go back and untick views.</summary>
+    public static bool AskExtraSheets(IntPtr revitHandle, int sheetCount)
+    {
+        var window = new DetailChoiceWindow(
+            "Detail Views",
+            $"These sets do not fit on one sheet - {sheetCount} sheets are needed.\n\n" +
+            "Add extra sheets, or go back and untick some views?",
+            "Add extra sheets", "Go back", revitHandle);
+        window.ShowDialog();
+        return window.Accepted;
+    }
+}
+
+internal sealed class DetailChoiceWindow : Window
+{
+    public bool Accepted { get; private set; }
+
+    public DetailChoiceWindow(
+        string title, string message, string acceptText, string declineText, IntPtr revitHandle)
+    {
+        Title = title;
+        SizeToContent = SizeToContent.WidthAndHeight;
+        MaxWidth = 520;
+        WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        ResizeMode = ResizeMode.NoResize;
+        WindowStyle = WindowStyle.ToolWindow;
+        ShowInTaskbar = false;
+        UseLayoutRounding = true;
+        FontFamily = AvTokens.Ui;
+        Background = AvTokens.Br(AvTokens.Surface);
+
+        if (revitHandle != IntPtr.Zero)
+            _ = new WindowInteropHelper(this) { Owner = revitHandle };
+
+        var icon = new Border
+        {
+            Width = 36,
+            Height = 36,
+            Background = AvTokens.B(AvTokens.WarnBg),
+            CornerRadius = new CornerRadius(18),
+            Margin = new Thickness(0, 0, 14, 0),
+            VerticalAlignment = VerticalAlignment.Top,
+            Child = new TextBlock
+            {
+                Text = "!",
+                FontSize = 17,
+                FontWeight = FontWeights.Bold,
+                Foreground = AvTokens.B(AvTokens.WarnFg),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+            },
+        };
+
+        var text = new TextBlock
+        {
+            Text = message,
+            FontSize = 13,
+            Foreground = AvTokens.B(AvTokens.Text),
+            TextWrapping = TextWrapping.Wrap,
+            LineHeight = 20,
+            MaxWidth = 400,
+        };
+
+        var content = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Margin = new Thickness(20, 20, 20, 16),
+        };
+        content.Children.Add(icon);
+        content.Children.Add(text);
+
+        var decline = AvControls.GhostBtn(declineText, () => { Accepted = false; Close(); });
+        decline.Margin = new Thickness(0, 0, 8, 0);
+        var accept = AvControls.PrimaryBtn(acceptText, () => { Accepted = true; Close(); });
+
+        var buttons = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Right,
+        };
+        buttons.Children.Add(decline);
+        buttons.Children.Add(accept);
+
+        var footer = new Border
+        {
+            Background = AvTokens.B(AvTokens.Surface2),
+            BorderBrush = AvTokens.B(AvTokens.Border),
+            BorderThickness = new Thickness(0, 1, 0, 0),
+            Padding = new Thickness(20, 12, 20, 12),
+            Child = buttons,
+        };
+
+        var root = new StackPanel();
+        root.Children.Add(content);
+        root.Children.Add(footer);
+        Content = root;
+    }
+}
+
+
+// =============================================================================
+// 18. BUTTON 5 - Cmd_DOC03e_Detail (selection-based detail views)
+// =============================================================================
+
+[Transaction(TransactionMode.Manual)]
+public sealed class Cmd_DOC03e_Detail : IExternalCommand
+{
+    private const string AlertTitle = "Detail Views";
+    private const string ReportTitle = "Detail Views";
+    private const string SettingsFile = "detail-views.json";
+
+    public Result Execute(ExternalCommandData commandData, ref string message,
+        ElementSet elements)
+    {
+        try
+        {
+            return Run(commandData.Application, out message);
+        }
+        catch (Autodesk.Revit.Exceptions.OperationCanceledException)
+        {
+            message = string.Empty;
+            return Result.Cancelled;
+        }
+        catch (Exception ex)
+        {
+            message = ex.Message;
+            return Result.Failed;
+        }
+    }
+
+    private static Result Run(UIApplication uiApp, out string message)
+    {
+        message = string.Empty;
+        var uiDoc = uiApp.ActiveUIDocument;
+        var doc = uiDoc.Document;
+
+        // ── What the project offers ─────────────────────────────────────────
+        var templates = ViewUtils.GetTemplates(doc);
+
+        var templates3d = FilterByType(templates, ViewType.ThreeD);
+        if (templates3d.Count == 0)
+        {
+            AvControls.ShowAlert(AlertTitle,
+                "No 3D view templates found in this project.", AlertSeverity.Warning);
+            return Result.Failed;
+        }
+
+        // Elevation, Section and Detail are one interchangeable group for the
+        // section views the API creates (see TemplatePicker.View2dTemplatesOf).
+        var templates2d = FilterByType(
+            templates, ViewType.Elevation, ViewType.Section, ViewType.Detail);
+        if (templates2d.Count == 0)
+        {
+            AvControls.ShowAlert(AlertTitle,
+                "No 2D view templates found in this project.\n\n" +
+                "An elevation, section or detail view template is required.",
+                AlertSeverity.Warning);
+            return Result.Failed;
+        }
+
+        var titleblocks = TitleblockUtils.CollectSymbols(doc);
+        if (titleblocks.Count == 0)
+        {
+            AvControls.ShowAlert(AlertTitle,
+                "No title block types found in this project.", AlertSeverity.Warning);
+            return Result.Failed;
+        }
+
+        var sheets = new FilteredElementCollector(doc)
+            .OfClass(typeof(ViewSheet))
+            .Cast<ViewSheet>()
+            .Where(s => !s.IsPlaceholder)
+            .OrderBy(s => s.SheetNumber, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var ctx = new DetailContext
+        {
+            Doc = doc,
+            RevitHandle = uiApp.MainWindowHandle,
+            Templates3D = templates3d,
+            Templates2D = templates2d,
+            Titleblocks = titleblocks,
+            SheetsByLabel = sheets
+                .GroupBy(s => $"{s.SheetNumber} - {s.Name}")
+                .ToDictionary(g => g.Key, g => g.First()),
+            UsedSheetNumbers = new HashSet<string>(
+                sheets.Select(s => s.SheetNumber), StringComparer.OrdinalIgnoreCase),
+            SectionBoxPaddingFt = SettingsStore
+                .LoadOrDefault<AssemblyDrawingsSettings>("assembly-drawings.json")
+                .SectionBoxPaddingFt(),
+        };
+
+        // ── Starting request, restored from the last run ────────────────────
+        var saved = SettingsStore.LoadOrDefault<DetailViewsSettings>(SettingsFile);
+
+        var req = new DetailRequest
+        {
+            Titleblock = TitleblockUtils.Resolve(titleblocks, saved.TitleBlockName, out _),
+            Mode = Enum.IsDefined(typeof(DetailTargetMode), saved.Mode)
+                ? (DetailTargetMode)saved.Mode
+                : DetailTargetMode.NewShared,
+            GapMm = saved.GapMm > 0 ? saved.GapMm : 50.0,
+        };
+        if (req.Mode == DetailTargetMode.ExistingSheet) req.Mode = DetailTargetMode.NewShared;
+
+        templates3d.TryGetValue(saved.View3DTemplateName ?? string.Empty, out var preset3d);
+        templates2d.TryGetValue(saved.View2DTemplateName ?? string.Empty, out var preset2d);
+        req.V3d = preset3d;
+        req.V2d = preset2d;
+        req.SheetNumber = DetailNaming.Allocate(
+            saved.LastSheetNumber ?? string.Empty, ctx.UsedSheetNumbers, 1)[0];
+
+        // A selection made before the click becomes the first set.
+        var preselected = uiDoc.Selection.GetElementIds();
+        if (preselected.Count > 0)
+        {
+            var first = new DetailSet { Name = NextSetName(req) };
+            first.SetElements(doc, preselected);
+            if (first.ElementIds.Count > 0) req.Sets.Add(first);
+        }
+
+        // ── Window loop ─────────────────────────────────────────────────────
+        // Adding or re-picking a set closes the window so the user can click in
+        // the model; the same request goes back in, so nothing is lost.
+        while (true)
+        {
+            var window = new DetailSetupWindow(req, ctx);
+            window.ShowDialog();
+
+            switch (window.Outcome)
+            {
+                case DetailWindowOutcome.AddSet:
+                {
+                    var ids = PickElements(uiDoc,
+                        "Select the elements for this detail, then click Finish.");
+                    if (ids is null) break;
+
+                    var set = new DetailSet { Name = NextSetName(req) };
+                    set.SetElements(doc, ids);
+                    if (set.ElementIds.Count == 0)
+                    {
+                        AvControls.ShowAlert(AlertTitle,
+                            "None of the picked elements could be used. Pick model " +
+                            "elements that have geometry.", AlertSeverity.Warning);
+                        break;
+                    }
+                    req.Sets.Add(set);
+                    break;
+                }
+
+                case DetailWindowOutcome.Repick:
+                {
+                    var ids = PickElements(uiDoc,
+                        "Select the elements for this detail, then click Finish.");
+                    if (ids is null) break;
+
+                    var set = req.Sets[window.RepickIndex];
+                    set.SetElements(doc, ids);
+                    if (set.ElementIds.Count == 0)
+                    {
+                        AvControls.ShowAlert(AlertTitle,
+                            "None of the picked elements could be used.",
+                            AlertSeverity.Warning);
+                    }
+                    break;
+                }
+
+                case DetailWindowOutcome.Run:
+                {
+                    if (req.Problem() is { } problem)
+                    {
+                        AvControls.ShowAlert(AlertTitle, problem, AlertSeverity.Warning);
+                        break;
+                    }
+
+                    if (ctx.BuildPlan(req) is not { } preview)
+                    {
+                        AvControls.ShowAlert(AlertTitle,
+                            "Could not measure the title block.", AlertSeverity.Warning);
+                        break;
+                    }
+
+                    if (preview.Plan.NeedsExtraSheets
+                        && !DetailPrompt.AskExtraSheets(
+                            uiApp.MainWindowHandle, preview.Plan.Sheets.Count))
+                    {
+                        break;      // back to the window to untick views
+                    }
+
+                    return Generate(uiApp, doc, req, ctx, saved, out message);
+                }
+
+                default:
+                    return Result.Cancelled;
+            }
+        }
+    }
+
+    private static string NextSetName(DetailRequest req)
+    {
+        var n = req.Sets.Count;
+        var name = n < 26 ? $"Detail {(char)('A' + n)}" : $"Detail {n + 1}";
+        while (req.Sets.Any(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+            name += "'";
+        return name;
+    }
+
+    private static IList<ElementId>? PickElements(UIDocument uiDoc, string prompt)
+    {
+        try
+        {
+            return uiDoc.Selection
+                .PickObjects(ObjectType.Element, new DetailSelectionFilter(), prompt)
+                .Select(r => r.ElementId)
+                .ToList();
+        }
+        catch (Autodesk.Revit.Exceptions.OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    private static IReadOnlyDictionary<string, View> FilterByType(
+        IReadOnlyDictionary<string, View> templates, params ViewType[] kinds) =>
+        templates
+            .Where(kv => Array.IndexOf(kinds, kv.Value.ViewType) >= 0)
+            .ToDictionary(kv => kv.Key, kv => kv.Value);
+
+    // ── Generation ──────────────────────────────────────────────────────────
+
+    private static Result Generate(
+        UIApplication uiApp, Document doc, DetailRequest req, DetailContext ctx,
+        DetailViewsSettings saved, out string message)
+    {
+        message = string.Empty;
+
+        var sets = req.PlannableSets();
+        var viewNames = AssemblyDrawingRunner.BuildViewNameRegistry(doc);
+
+        var built = new Dictionary<int, IReadOnlyDictionary<string, View>>();
+        var failures = new Dictionary<int, string>();
+
+        using var tx = new Transaction(doc, "Detail Views");
+        tx.Start();
+        FailureHandling.SuppressWarnings(tx);
+
+        // 1. Views, one sub-transaction per set so a failing set rolls back alone.
+        for (var i = 0; i < sets.Count; i++)
+        {
+            using var sub = new SubTransaction(doc);
+            sub.Start();
+            try
+            {
+                built[i] = DetailViewBuilder.Build(
+                    doc, sets[i], req, ctx.SectionBoxPaddingFt, viewNames);
+                sub.Commit();
+            }
+            catch (Exception ex)
+            {
+                sub.RollBack();
+                failures[i] = ex.Message;
+            }
+        }
+
+        // 2. Re-plan with the measured views. Position i in planSets is
+        //    sets[okIndexes[i]].
+        var okIndexes = built.Keys.OrderBy(k => k).ToList();
+        var placements = new Dictionary<int, List<string>>();     // set -> where it went
+        var warnings = new Dictionary<int, List<string>>();
+
+        List<string> WarningsOf(int setIndex) =>
+            warnings.TryGetValue(setIndex, out var list) ? list : warnings[setIndex] = [];
+
+        if (okIndexes.Count > 0)
+        {
+            var frame = ctx.FrameFor(req);
+            if (frame is null)
+            {
+                tx.RollBack();
+                message = "Could not measure the title block.";
+                return Result.Failed;
+            }
+
+            var planSets = okIndexes
+                .Select(i => new PlanSet(
+                    sets[i].Name,
+                    DetailKeys.Order
+                        .Where(built[i].ContainsKey)
+                        .Select(k =>
+                        {
+                            var (w, h) = DetailViewBuilder.MeasuredSize(
+                                sets[i], k, built[i][k], ctx.SectionBoxPaddingFt);
+                            return new PlanView(k, w, h);
+                        })
+                        .ToList()))
+                .ToList();
+
+            var plan = DetailPlanner.Plan(
+                planSets, frame.Value.UsableWidth, frame.Value.UsableHeight, req.Mode);
+            DetailNaming.Apply(
+                plan, planSets.Select(s => s.Name).ToList(), req.Mode,
+                req.SheetName, req.SheetNumber, ctx.UsedSheetNumbers);
+
+            // 3. Sheets and viewports, one sub-transaction per page.
+            foreach (var page in plan.Sheets)
+            {
+                using var sub = new SubTransaction(doc);
+                sub.Start();
+
+                var pageSets = page.SetIndexes.Select(p => okIndexes[p]).Distinct().ToList();
+                try
+                {
+                    ViewSheet sheet;
+                    XYZ centre;
+
+                    if (req.Mode == DetailTargetMode.ExistingSheet)
+                    {
+                        sheet = req.ExistingSheet!;
+                        centre = frame.Value.Center + new XYZ(
+                            0, DetailPlanner.StagingOffsetY(
+                                page.PageIndex, frame.Value.FullHeight, req.GapFt), 0);
+                    }
+                    else
+                    {
+                        sheet = ViewSheet.Create(doc, req.Titleblock!.Id);
+                        sheet.SheetNumber = page.Number;
+                        sheet.Name = page.Name;
+                        centre = SheetFrame.Measure(
+                            doc, sheet, DetailPlanner.UsableFraction).Center;
+                    }
+
+                    foreach (var pv in page.Views)
+                    {
+                        var setIndex = okIndexes[pv.SetIndex];
+                        var view = built[setIndex][pv.Key];
+
+                        try { view.Scale = pv.Scale; }
+                        catch
+                        {
+                            WarningsOf(setIndex).Add(
+                                $"{view.Name}: the view template stops the scale being set; " +
+                                $"it stays at 1:{view.Scale}.");
+                        }
+
+                        var point = new XYZ(centre.X + pv.CenterX, centre.Y + pv.CenterY, 0);
+                        if (ViewUtils.PlaceView(doc, sheet, view, point) is null)
+                        {
+                            throw new InvalidOperationException(
+                                $"{view.Name} cannot be added to sheet {sheet.SheetNumber}.");
+                        }
+
+                        if (pv.Scale > DetailPlanner.ScaleWarnAbove)
+                        {
+                            var note = DetailKeys.Is3D(pv.Key)
+                                ? $"3D comes out at 1:{pv.Scale}."
+                                : $"The 2D views come out at 1:{pv.Scale}.";
+                            var notes = WarningsOf(setIndex);
+                            if (!notes.Contains(note)) notes.Add(note);
+                        }
+                    }
+
+                    sub.Commit();
+
+                    var label = req.Mode == DetailTargetMode.ExistingSheet
+                        ? $"{sheet.SheetNumber} (below the frame)"
+                        : sheet.SheetNumber;
+
+                    foreach (var i in pageSets)
+                    {
+                        if (!placements.TryGetValue(i, out var where)) placements[i] = where = [];
+                        where.Add(label);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    sub.RollBack();
+                    foreach (var i in pageSets)
+                        failures[i] = $"Views were created but could not be placed: {ex.Message}";
+                }
+            }
+
+            if (req.Mode == DetailTargetMode.ExistingSheet)
+            {
+                foreach (var (i, _) in placements)
+                {
+                    var count = built[i].Count;
+                    WarningsOf(i).Add(
+                        $"{count} view{(count == 1 ? "" : "s")} placed below sheet " +
+                        $"{req.ExistingSheet!.SheetNumber}. Move them into position.");
+                }
+            }
+
+            if (req.Mode != DetailTargetMode.ExistingSheet && plan.Sheets.Count > 0)
+                saved.LastSheetNumber = plan.Sheets[^1].Number;
+        }
+
+        tx.Commit();
+
+        // 4. Remember the choices, then report.
+        saved.TitleBlockName = req.Titleblock is null ? saved.TitleBlockName
+            : TitleblockUtils.DisplayName(req.Titleblock);
+        saved.View3DTemplateName = req.V3d?.Name ?? saved.View3DTemplateName;
+        saved.View2DTemplateName = req.V2d?.Name ?? saved.View2DTemplateName;
+        saved.Mode = (int)req.Mode;
+        saved.GapMm = req.GapMm;
+        SettingsStore.Save(SettingsFile, saved);
+
+        var results = new List<(string Name, string? Error, string? Warning)>();
+        for (var i = 0; i < sets.Count; i++)
+        {
+            var set = sets[i];
+
+            if (failures.TryGetValue(i, out var error))
+            {
+                results.Add((set.Name, error, null));
+                continue;
+            }
+
+            var notes = warnings.TryGetValue(i, out var w) ? new List<string>(w) : [];
+            if (set.SkippedCount > 0)
+            {
+                notes.Add($"{set.SkippedCount} picked element" +
+                          $"{(set.SkippedCount == 1 ? " was" : "s were")} skipped " +
+                          "(no geometry or not a model element).");
+            }
+
+            var where = placements.TryGetValue(i, out var p) ? string.Join(", ", p) : "";
+            results.Add((
+                where.Length > 0 ? $"{set.Name}  →  {where}" : set.Name,
+                null,
+                notes.Count > 0 ? string.Join("\n", notes) : null));
+        }
+
+        Reporting.ShowResult(ReportTitle, results, uiApp.MainWindowHandle);
+        return Result.Succeeded;
+    }
 }
