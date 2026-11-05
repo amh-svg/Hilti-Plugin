@@ -7,6 +7,9 @@
 //     tall/wide element handling).
 //   - Vendor Tag: Same batch view/tag picker and auto-placement logic as
 //     MT Tag, also targeting Generic Model tag families.
+// Both windows have a Tag Density slider (10-100%, steps of 10) that sets
+// what share of the elements get tagged, largest first. The last value is
+// remembered per button. Defaults: MT 100%, Vendor 30%.
 // -----------------------------------------------------------------------
 // Autodesk
 using Autodesk.Revit.Attributes;
@@ -90,6 +93,68 @@ namespace AVES.Commands
                 System.IO.File.WriteAllLines(ConfigFile, lines);
             }
             catch { /* Non-fatal — worst case the user just picks again next run. */ }
+        }
+    }
+
+    // ============================================================
+    //  TAG DENSITY
+    //  The "% of elements to tag" slider shared by MT and Vendor.
+    //  Memory is keyed per button ("MT" / "Vendor") and stored per-user in
+    //  %AppData%\AVES\last_tag_percent.txt as "Key<TAB>Percent" lines.
+    // ============================================================
+    internal static class TagDensity
+    {
+        public const int Min = 10, Max = 100, Step = 10;
+
+        public static int Clamp(int pct) => Math.Max(Min, Math.Min(Max, pct));
+
+        /// <summary>
+        /// How many of <paramref name="total"/> elements to tag. Groups of 1-2 are
+        /// always tagged in full; otherwise ceil(total * pct / 100), at least 1.
+        /// Integer arithmetic on purpose: ceil(10 * 0.30) can land on 4 in doubles.
+        /// </summary>
+        public static int PickCount(int total, int pct)
+        {
+            if (total <= 2) return total;
+            int n = (total * Clamp(pct) + 99) / 100;
+            return Math.Max(1, Math.Min(total, n));
+        }
+
+        /// <summary>The PickCount largest items by <paramref name="area"/>.</summary>
+        public static List<T> SelectLargest<T>(IList<T> items, int pct, Func<T, double> area) =>
+            items.OrderByDescending(area).Take(PickCount(items.Count, pct)).ToList();
+
+        private static readonly string ConfigFile = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "AVES", "last_tag_percent.txt");
+
+        internal static int? TryGet(string key)
+        {
+            try
+            {
+                if (!System.IO.File.Exists(ConfigFile)) return null;
+                string prefix = key + "\t";
+                foreach (string line in System.IO.File.ReadAllLines(ConfigFile))
+                    if (line.StartsWith(prefix) && int.TryParse(line.Substring(prefix.Length), out int v))
+                        return Clamp(v);
+            }
+            catch { }
+            return null;
+        }
+
+        internal static void Save(string key, int pct)
+        {
+            try
+            {
+                System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(ConfigFile)!);
+                string prefix = key + "\t";
+                var lines = System.IO.File.Exists(ConfigFile)
+                    ? System.IO.File.ReadAllLines(ConfigFile).Where(l => !l.StartsWith(prefix)).ToList()
+                    : new List<string>();
+                lines.Add(prefix + pct);
+                System.IO.File.WriteAllLines(ConfigFile, lines);
+            }
+            catch { /* Non-fatal — worst case the slider resets to its default. */ }
         }
     }
 
@@ -339,18 +404,27 @@ namespace AVES.Commands
         private ElementId _selectedTagFamilyId = ElementId.InvalidElementId;
         public ElementId SelectedTagFamilyId => _selectedTagFamilyId;
 
+        // Tag density section (% of elements tagged per assembly)
+        private readonly string _densityKey;
+        private Slider _densitySlider = null!;
+        private TextBlock _densityLbl = null!;
+        public int SelectedPercent => TagDensity.Clamp((int)Math.Round(_densitySlider.Value));
+
         // confirmLabel is injected so both MT and Vendor can share this window
         // with their own footer button text. tagCat/tagSectionLabel let each
         // button load its own tag family list (MultiCategoryTags vs GenericModelTags)
-        // into the same in-window picker.
+        // into the same in-window picker. densityKey/defaultPercent give each
+        // button its own remembered slider value and default.
         public BatchViewPickerWindow(
             List<ViewEntry> entries, Document doc, BuiltInCategory tagCat, string tagSectionLabel,
+            string densityKey, int defaultPercent,
             string confirmLabel = "▶  Run Script")
         {
             _all = entries;
+            _densityKey = densityKey;
 
             Title = "Batch Tag";
-            Width = 520; Height = 680;
+            Width = 520; Height = 720;
             WindowStyle = WindowStyle.SingleBorderWindow;
             ResizeMode = ResizeMode.NoResize;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
@@ -373,8 +447,12 @@ namespace AVES.Commands
             DockPanel.SetDock(tagSection, Dock.Top);
             body.Children.Add(tagSection);
 
+            var densitySection = BuildDensitySection(defaultPercent);
+            DockPanel.SetDock(densitySection, Dock.Top);
+            body.Children.Add(densitySection);
+
             var viewsSectionTitle = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 10) };
-            viewsSectionTitle.Children.Add(AvControls.NumberBadge(2));
+            viewsSectionTitle.Children.Add(AvControls.NumberBadge(3));
             viewsSectionTitle.Children.Add(new TextBlock
             {
                 Text = "Select Views",
@@ -512,6 +590,101 @@ namespace AVES.Commands
 
             stack.Children.Add(_tagFamilyBtn);
             return new Border { Child = stack };
+        }
+
+        private Border BuildDensitySection(int defaultPercent)
+        {
+            int initial = TagDensity.Clamp(TagDensity.TryGet(_densityKey) ?? defaultPercent);
+
+            var stack = new StackPanel { Margin = new Thickness(0, 0, 0, 4) };
+
+            // Title row: badge + label on the left, live value on the right.
+            var titleRow = new DockPanel { Margin = new Thickness(0, 0, 0, 6), LastChildFill = true };
+            _densityLbl = new TextBlock
+            {
+                Text = initial + "%",
+                FontFamily = AvTokens.Ui,
+                FontSize = 13,
+                FontWeight = FontWeights.Bold,
+                Foreground = AvTokens.B(AvTokens.Accent),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            DockPanel.SetDock(_densityLbl, Dock.Right);
+            titleRow.Children.Add(_densityLbl);
+
+            var left = new StackPanel { Orientation = Orientation.Horizontal };
+            left.Children.Add(AvControls.NumberBadge(2));
+            left.Children.Add(new TextBlock
+            {
+                Text = "Tag Density",
+                FontFamily = AvTokens.Ui,
+                FontSize = 12.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = AvTokens.B(AvTokens.TextFaint),
+                VerticalAlignment = VerticalAlignment.Center
+            });
+            titleRow.Children.Add(left);
+            stack.Children.Add(titleRow);
+
+            _densitySlider = BuildSlider(initial);
+            _densitySlider.ValueChanged += (s, e) =>
+                _densityLbl.Text = TagDensity.Clamp((int)Math.Round(_densitySlider.Value)) + "%";
+            stack.Children.Add(_densitySlider);
+
+            var ends = new DockPanel { Margin = new Thickness(2, 0, 2, 4) };
+            var maxLbl = new TextBlock
+            {
+                Text = "more tags",
+                FontFamily = AvTokens.Ui, FontSize = 11,
+                Foreground = AvTokens.B(AvTokens.TextFaint)
+            };
+            DockPanel.SetDock(maxLbl, Dock.Right);
+            ends.Children.Add(maxLbl);
+            ends.Children.Add(new TextBlock
+            {
+                Text = "fewer tags",
+                FontFamily = AvTokens.Ui, FontSize = 11,
+                Foreground = AvTokens.B(AvTokens.TextFaint)
+            });
+            stack.Children.Add(ends);
+            return new Border { Child = stack };
+        }
+
+        // Accent-coloured slider: filled track left of the thumb, grey right of it.
+        private static Slider BuildSlider(int value)
+        {
+            string xaml =
+                "<ControlTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' " +
+                "xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' TargetType='{x:Type Slider}'>" +
+                "<Grid Height='24' Background='Transparent'>" +
+                "<Track x:Name='PART_Track'>" +
+                "<Track.DecreaseRepeatButton><RepeatButton Command='Slider.DecreaseLarge' Focusable='False' Background='" + AvTokens.Accent + "'>" +
+                "<RepeatButton.Template><ControlTemplate TargetType='{x:Type RepeatButton}'>" +
+                "<Border Background='{TemplateBinding Background}' Height='4' CornerRadius='2' VerticalAlignment='Center'/>" +
+                "</ControlTemplate></RepeatButton.Template></RepeatButton></Track.DecreaseRepeatButton>" +
+                "<Track.IncreaseRepeatButton><RepeatButton Command='Slider.IncreaseLarge' Focusable='False' Background='" + AvTokens.BorderStrong + "'>" +
+                "<RepeatButton.Template><ControlTemplate TargetType='{x:Type RepeatButton}'>" +
+                "<Border Background='{TemplateBinding Background}' Height='4' CornerRadius='2' VerticalAlignment='Center'/>" +
+                "</ControlTemplate></RepeatButton.Template></RepeatButton></Track.IncreaseRepeatButton>" +
+                "<Track.Thumb><Thumb Width='18' Height='18' Cursor='Hand' Focusable='False'>" +
+                "<Thumb.Template><ControlTemplate TargetType='{x:Type Thumb}'>" +
+                "<Ellipse Fill='White' Stroke='" + AvTokens.Accent + "' StrokeThickness='2.5'/>" +
+                "</ControlTemplate></Thumb.Template></Thumb></Track.Thumb>" +
+                "</Track></Grid></ControlTemplate>";
+
+            return new Slider
+            {
+                Minimum = TagDensity.Min,
+                Maximum = TagDensity.Max,
+                TickFrequency = TagDensity.Step,
+                IsSnapToTickEnabled = true,
+                SmallChange = TagDensity.Step,
+                LargeChange = TagDensity.Step,
+                Value = value,
+                Focusable = true,
+                Margin = new Thickness(0, 0, 0, 2),
+                Template = (ControlTemplate)System.Windows.Markup.XamlReader.Parse(xaml)
+            };
         }
 
         private Border BuildSearchBox()
@@ -709,6 +882,7 @@ namespace AVES.Commands
             SelectedViews.Clear();
             foreach (var (_, box, view) in _visible)
                 if (box.IsChecked == true) SelectedViews.Add(view);
+            TagDensity.Save(_densityKey, SelectedPercent);
             DialogResult = true;
         }
 
@@ -1131,13 +1305,14 @@ namespace AVES.Commands
             // 2. Single window: pick tag family (in-window section) + multi-select views
             var picker = new BatchViewPickerWindow(
                 entries, doc, BuiltInCategory.OST_GenericModelTags,
-                "MT Tag Family", "▶  Run Script");
+                "MT Tag Family", "MT", 100, "▶  Run Script");
             if (picker.ShowDialog() != true
                 || picker.SelectedViews.Count == 0
                 || picker.SelectedTagFamilyId == ElementId.InvalidElementId)
                 return Result.Cancelled;
 
             ElementId tagTypeId = picker.SelectedTagFamilyId;
+            int tagPercent = picker.SelectedPercent;
             List<View3D> selectedViews = picker.SelectedViews;
 
             // 3. Tag each selected view, collect structured log rows
@@ -1172,27 +1347,34 @@ namespace AVES.Commands
 
                 GetViewAxes(view, out XYZ right, out XYZ up, out XYZ fwd);
 
-                var elData = new List<(Element El,
+                var elDataAll = new List<(Element El,
                     (double UMin, double UMax, double VMin, double VMax) Rect,
                     double Depth)>();
                 foreach (Element el in modelElements)
                 {
                     if (!TryGetScreenRect(el, view, right, up, out var rect)) continue;
-                    elData.Add((el, rect, GetElementDepth(el, view, fwd)));
+                    elDataAll.Add((el, rect, GetElementDepth(el, view, fwd)));
                 }
 
-                if (elData.Count == 0)
+                if (elDataAll.Count == 0)
                 {
                     row.Status = "skip"; row.Notes = "Could not project elements";
                     logRows.Add(row); continue;
                 }
 
-                double asmUMin = elData.Min(e => e.Rect.UMin);
-                double asmUMax = elData.Max(e => e.Rect.UMax);
-                double asmVMin = elData.Min(e => e.Rect.VMin);
-                double asmVMax = elData.Max(e => e.Rect.VMax);
-                double medDepth = elData.Select(e => e.Depth).OrderBy(d => d)
-                                        .ElementAt(elData.Count / 2);
+                // Tag Density slider: tag only the largest N% of the view's
+                // elements. Assembly bounds still come from ALL elements so the
+                // slot columns/rows sit at the true assembly edges. At 100% this
+                // is the full set, i.e. the previous behaviour.
+                var elData = TagDensity.SelectLargest(elDataAll, tagPercent,
+                    e => (e.Rect.UMax - e.Rect.UMin) * (e.Rect.VMax - e.Rect.VMin));
+
+                double asmUMin = elDataAll.Min(e => e.Rect.UMin);
+                double asmUMax = elDataAll.Max(e => e.Rect.UMax);
+                double asmVMin = elDataAll.Min(e => e.Rect.VMin);
+                double asmVMax = elDataAll.Max(e => e.Rect.VMax);
+                double medDepth = elDataAll.Select(e => e.Depth).OrderBy(d => d)
+                                           .ElementAt(elDataAll.Count / 2);
 
                 double colLeft = asmUMin - EdgeClearanceFt;
                 double colRight = asmUMax + EdgeClearanceFt;
@@ -1575,13 +1757,14 @@ namespace AVES.Commands
             // 2. Single window: pick tag family (in-window section) + multi-select views
             var picker = new BatchViewPickerWindow(
                 entries, doc, BuiltInCategory.OST_GenericModelTags,
-                "Vendor Tag Family", "▶  Run Script");
+                "Vendor Tag Family", "Vendor", 30, "▶  Run Script");
             if (picker.ShowDialog() != true
                 || picker.SelectedViews.Count == 0
                 || picker.SelectedTagFamilyId == ElementId.InvalidElementId)
                 return Result.Cancelled;
 
             ElementId tagTypeId = picker.SelectedTagFamilyId;
+            int tagPercent = picker.SelectedPercent;
             List<View3D> selectedViews = picker.SelectedViews;
 
             // 3. Tag each selected view, collect structured log rows
@@ -1633,7 +1816,7 @@ namespace AVES.Commands
                 }
 
                 // Select representatives: group by Comments, pick top N by screen area
-                var elData = SelectRepresentativesByComments(elDataAll);
+                var elData = SelectRepresentativesByComments(elDataAll, tagPercent);
 
                 if (elData.Count == 0)
                 {
@@ -1758,17 +1941,17 @@ namespace AVES.Commands
         }
 
         // ── Comments-group representative selection ───────────────────────────
-        // Rules:
-        //   group size 1 → tag 1   (100%)
-        //   group size 2 → tag 2   (100%, 30% of 2 < 1)
-        //   group size 3+ → tag ceil(count * 0.30), pick by largest screen area
+        // Rules (percent comes from the Tag Density slider; default 30):
+        //   group size 1 → tag 1
+        //   group size 2 → tag 2
+        //   group size 3+ → tag ceil(count * percent / 100), pick by largest screen area
         private static List<(Element El,
             (double UMin, double UMax, double VMin, double VMax) Rect,
             double Depth)>
             SelectRepresentativesByComments(
                 List<(Element El,
                     (double UMin, double UMax, double VMin, double VMax) Rect,
-                    double Depth)> all)
+                    double Depth)> all, int percent)
         {
             // Group by Comments parameter value; elements with null/empty Comments
             // each form their own singleton group so they are still tagged.
@@ -1787,19 +1970,9 @@ namespace AVES.Commands
             foreach (var group in groups)
             {
                 var members = group.ToList();
-                int total = members.Count;
-
-                int pick = total <= 2
-                    ? total
-                    : (int)Math.Ceiling(total * 0.30);
-
-                // Sort descending by screen-projected area, take top N
-                var top = members
-                    .OrderByDescending(e =>
-                        (e.Rect.UMax - e.Rect.UMin) * (e.Rect.VMax - e.Rect.VMin))
-                    .Take(pick);
-
-                result.AddRange(top);
+                // Largest screen-projected area first, top N per the slider.
+                result.AddRange(TagDensity.SelectLargest(members, percent,
+                    e => (e.Rect.UMax - e.Rect.UMin) * (e.Rect.VMax - e.Rect.VMin)));
             }
 
             return result;
