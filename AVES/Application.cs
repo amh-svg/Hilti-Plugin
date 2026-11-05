@@ -79,8 +79,8 @@ namespace AVES
             // Add buttons to "Sheet Creation" pulldown
             pulldown2.Ext_AddPushButton("Assembly Drawings", "AVES.Commands.Cmd_DOC03a_Assembly");
             pulldown2.Ext_AddPushButton("MT Drawings", "AVES.Commands.Cmd_DOC03b_MT");
+            pulldown2.Ext_AddPushButton("Seoul Drawings", "AVES.Commands.Cmd_DOC03d_Seoul");
             pulldown2.Ext_AddPushButton("Vendor Drawings", "AVES.Commands.Cmd_DOC03c_Vendor");
-            pulldown2.Ext_AddPushButton("Korea Drawings", "AVES.Commands.Cmd_DOC03d_Korea");
             pulldown2.Ext_AddPushButton("Detail Views", "AVES.Commands.Cmd_DOC03e_Detail");
 
             // Add "Add Dimensions" pulldownbutton to panel

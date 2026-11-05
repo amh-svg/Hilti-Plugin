@@ -2950,7 +2950,7 @@ internal sealed class VendorLayoutDescriptorImpl : VendorLayoutDescriptor
 /// </summary>
 internal sealed class KoreaLayoutDescriptorImpl : VendorLayoutDescriptor
 {
-    public override string DialogTitle => "Korea Drawings";
+    public override string DialogTitle => "Seoul Drawings";
 
     public override bool ShowClusterSection => false;
 
@@ -3310,7 +3310,7 @@ internal sealed class MTDrawingsSettingsDialog
 internal static class SettingsGate
 {
     // The one place both commands' offsets file names are spelled out --
-    // Cmd_DOC03c_Vendor and Cmd_DOC03d_Korea reference these same constants
+    // Cmd_DOC03c_Vendor and Cmd_DOC03d_Seoul reference these same constants
     // (also for AssemblyDrawingProfile.TemplateSettingsFile) rather than each
     // holding its own copy of the literal.
     public const string VendorOffsetsFile = "vendor-drawings.json";
@@ -5174,19 +5174,19 @@ public sealed class Cmd_DOC03c_Vendor : IExternalCommand
 
 
 // =============================================================================
-// 9. BUTTON 4 — Cmd_DOC03d_Korea (one view per sheet)
+// 9. BUTTON 4 — Cmd_DOC03d_Seoul (one view per sheet)
 // =============================================================================
 
 [Transaction(TransactionMode.Manual)]
-public sealed class Cmd_DOC03d_Korea : IExternalCommand
+public sealed class Cmd_DOC03d_Seoul : IExternalCommand
 {
     private static readonly VendorLayoutDescriptor Descriptor =
         VendorLayoutDescriptor.Korea;
 
     private static readonly AssemblyDrawingProfile Profile = new(
-        "Korea Automation",
+        "Seoul Automation",
         "Korea Sheets - Batch",
-        "Korea Drawing Automation",
+        "Seoul Drawing Automation",
         uiApp => Descriptor.CreateLayoutFrom(uiApp, SettingsGate.KoreaOffsetsFile),
         TemplateSettingsFile: SettingsGate.KoreaOffsetsFile,
         PackageType: "Korea");
