@@ -165,4 +165,7 @@
   <data name="MEK03_TrayArmour" xml:space="preserve">
     <value>Place one armour by hand, box-select it, pick its tray and set a spacing; the armour is replicated along the straight runs.</value>
   </data>
+  <data name="DOC09_CleanViews" xml:space="preserve">
+    <value>On the open sheet, hide everything in the chosen views except the Generic Model elements of the assembly shown and tags. If a view shows several assemblies, you choose which one to keep. One undo reverses the run.</value>
+  </data>
 </root>

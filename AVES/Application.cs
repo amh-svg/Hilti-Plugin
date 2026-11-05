@@ -104,6 +104,9 @@ namespace AVES
             pulldown5.Ext_AddPushButton("By Assembly", "AVES.Commands.Cmd_DOC01a_Assembly");
             pulldown5.Ext_AddPushButton("By Assembly A", "AVES.Commands.Cmd_DOC01b_AssemblyA");
 
+            // Add "Clean Views" button to panel
+            var buttonCleanViews = panelSheets.Ext_AddPushButton("Clean\nViews", "AVES.Commands.Cmd_DOC09_CleanViews");
+
             // Add button to panel
             // var buttonAddNested = panelSheets.Ext_AddPushButton("Add Nested\nto Assemblies", "AVES.Commands.Cmd_DOC08_AddNested");
 
