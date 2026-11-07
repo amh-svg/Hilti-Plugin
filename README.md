@@ -28,6 +28,7 @@ A productivity add-in for Autodesk Revit that automates common family management
 | **Part List Format** | Lets the user pick one or more assemblies, then generates merged part-number/description strings and sequential row numbers for their Generic Model members, writing the results back onto the elements |
 | **Assembly Weight** | Lets the user pick assemblies and a source weight parameter, totals the weight of each assembly's members, and writes the result to a chosen parameter on that assembly's sheet(s) |
 | **Export Families** | Exports the parent Families of the currently selected family instances as .rfa files to a user-chosen folder |
+| **Export GLB + BOM** | In the Family Editor, exports the active family as a GLB with one named node per subpart, plus a BOM JSON with the subpart quantities, for the current type or all types. Optional Meshopt compression needs Node.js |
 | **Revisions & Title Block Fill** | Opens a sheet picker/tool window where the user selects sheets, chooses revisions to add, and resolves title block field values to apply |
 | **Assembly Tag Completeness Checker** | Lets the user pick assembly views, scans the assemblies shown in them for family types with untagged members, and displays a report of which types are missing tags in each view |
 
