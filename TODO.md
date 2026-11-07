@@ -161,3 +161,7 @@ Read: this file is a required build input (per the `.csproj`) that's currently u
 - The repo's root `.gitignore` is the standard GitHub `VisualStudio.gitignore` template (ignores `bin/`, `obj/`, etc.) -- it has **no entry** for `installer_output/` or `*.exe` build artifacts. Confirmed via `find`/`cat`, no `.gitignore` in `AVES/` either.
 
 Read: this repo has been committing built installer binaries directly (v1.0.0 is proof), and continuing that practice means every future version bump adds another ~2.3MB binary to git history permanently -- there's no cleanup path for old versions once committed this way. Worth a decision: either keep tracking installer builds as releases happen (and accept the repo grows every version), or add `installer_output/` to `.gitignore` and distribute installers some other way (e.g. GitHub Releases) instead.
+
+## PostBuild always deploys to the Revit 2025 folder
+
+The `PostBuild` target in `AVES.csproj` hard-codes `%AppData%\Autodesk\Revit\Addins\2025\AVES`, and it runs for every Debug configuration. A `Debug R26` build therefore overwrites the 2025 test DLL with the R26 assembly. It should use `$(RevitVersion)` in the path. Not fixed yet; until then, stick to `Debug R25` when testing in Revit 2025.

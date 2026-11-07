@@ -57,6 +57,7 @@ namespace AVES
             // Add button to panel
             var buttonRenameFamilyNameAndType = panelFamilyEdition.Ext_AddPushButton("Rename\nFamily", "AVES.Commands.Cmd_FAM01_Rename");
             var buttonDownloadFamilies = panelFamilyEdition.Ext_AddPushButton("Download\nFamilies", "AVES.Commands.Cmd_FAM02_Download");
+            var buttonExportGlb = panelFamilyEdition.Ext_AddPushButton("Export\nGLB + BOM", "AVES.Commands.Cmd_FAM04_ExportGlb");
 
             // Add pulldownbutton to panel
             var pulldownTest = panelFamilyEdition.Ext_AddPulldownButton("Family\nParameters", "AVES.Commands.Cmd_FAM03_Parameters");

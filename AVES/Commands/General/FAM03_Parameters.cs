@@ -1145,11 +1145,15 @@ namespace AVES.Commands
         private readonly TextBlock _countLabel;
         private readonly TextBlock _captionLabel;
         private int _total;
+        private readonly string _itemName;
+        private readonly string _itemNamePlural;
 
         public bool IsCancelled { get; private set; }
 
-        public BatchProgressWindow(string windowTitle, int total)
+        public BatchProgressWindow(string windowTitle, int total, string itemName = "family", string itemNamePlural = "families")
         {
+            _itemName = itemName;
+            _itemNamePlural = itemNamePlural;
             _total = total;
             Width = 480;
             Height = 220;
@@ -1253,7 +1257,7 @@ namespace AVES.Commands
 
             int remaining = total - current;
             _captionLabel.Text = remaining > 0
-                ? $"{remaining} {(remaining == 1 ? "family" : "families")} remaining"
+                ? $"{remaining} {(remaining == 1 ? _itemName : _itemNamePlural)} remaining"
                 : "Finishing up…";
 
             Dispatcher.Invoke(new Action(() => { }), DispatcherPriority.Render);
