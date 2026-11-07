@@ -1,6 +1,6 @@
 // -----------------------------------------------------------------------
 // Title: Family GLB Exporter
-// Summary: Exports the current type of an open family document as a .glb,
+// Summary: Exports one or all types of an open family document as a .glb,
 //          with each nested subpart as a named node, and a .bom.json with
 //          the subpart quantities.
 // Key logic: Only the direct nested instances count, so a subpart with its
@@ -27,7 +27,19 @@ namespace AVES.Core.GlbExport
     {
         public string OutputFolder { get; set; } = "";
 
-        /// <summary>Meshes above this count are logged as likely perforated.</summary>
+        /// <summary>Exports every type of the family, not just the current one.</summary>
+        public bool AllTypes { get; set; }
+
+        /// <summary>Compresses each .glb with Meshopt when npx is available.</summary>
+        public bool Compress { get; set; }
+
+        /// <summary>
+        /// Warns about meshes above <see cref="TriangleWarningThreshold"/>.
+        /// TODO: replace such plates with their outer boundary, without the holes.
+        /// </summary>
+        public bool FlagPerforations { get; set; } = true;
+
+        /// <summary>Meshes above this count are treated as likely perforated.</summary>
         public int TriangleWarningThreshold { get; set; } = 20000;
 
         /// <summary>
@@ -38,18 +50,23 @@ namespace AVES.Core.GlbExport
         public List<string> FrameExcludedNames { get; set; } = new() { " - Cam", "button fix set" };
     }
 
-    /// <summary>What one export run produced.</summary>
+    /// <summary>What exporting one type produced.</summary>
     internal sealed class GlbExportResult
     {
+        public string TypeName { get; set; } = "";
         public string GlbPath { get; set; } = "";
         public string BomPath { get; set; } = "";
         public BomFile Bom { get; set; } = new();
         public int WarningCount { get; set; }
+        public bool Compressed { get; set; }
+
+        /// <summary>Why this type failed, or null if it was exported.</summary>
+        public string? Error { get; set; }
     }
 
     internal sealed class FamilyGlbExporter
     {
-        public const string ExporterVersion = "0.1.0";
+        public const string ExporterVersion = "0.2.0";
 
         private const double MillimetresPerFoot = 304.8;
         private const long NoMaterialKey = -1;
@@ -58,6 +75,7 @@ namespace AVES.Core.GlbExport
         private readonly GlbExportOptions _options;
         private readonly GlbExportLog _log;
         private readonly Action<int, int, string>? _progress;
+        private string _statusPrefix = "";
 
         /// <param name="doc">An open family document.</param>
         /// <param name="options">The export settings.</param>
@@ -79,17 +97,121 @@ namespace AVES.Core.GlbExport
         //  EXPORT
         // ─────────────────────────────────────────────────────────────────────
 
-        /// <summary>Exports the family's current type.</summary>
-        public GlbExportResult ExportCurrentType()
+        /// <summary>
+        /// Exports the current type, or every type if the options say so. One
+        /// type failing does not stop the others; its result carries the error.
+        /// </summary>
+        public List<GlbExportResult> Export()
         {
-            var familyName = FamilyName(_doc);
-            var typeName = _doc.FamilyManager.CurrentType?.Name ?? "";
             var wasModified = _doc.IsModified;
 
-            _log.Line($"Exporter {ExporterVersion}, family \"{familyName}\", type \"{typeName}\"");
+            _log.Line($"Exporter {ExporterVersion}, family \"{FamilyName(_doc)}\"");
             _log.Line($"Document path: {_doc.PathName}");
             _log.Line($"Family category: {_doc.OwnerFamily?.FamilyCategory?.Name}");
             _log.Line($"IsModified before: {wasModified}");
+
+            var types = _doc.FamilyManager.Types
+                .Cast<FamilyType>()
+                .OrderBy(t => t.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            // Only switching types writes to the document, so a single type
+            // needs no transaction at all.
+            var results = _options.AllTypes && types.Count > 1
+                ? ExportEachType(types)
+                : new List<GlbExportResult> { ExportCurrentTypeSafely() };
+
+            _log.Section("RUN");
+            _log.Line($"IsModified after: {_doc.IsModified}");
+            if (_doc.IsModified != wasModified)
+                _log.Warning("The document's modified state changed during the export.");
+
+            return results;
+        }
+
+        /// <summary>
+        /// Switches through the types inside one transaction, which is always
+        /// rolled back, so the family is left as it was.
+        /// </summary>
+        private List<GlbExportResult> ExportEachType(List<FamilyType> types)
+        {
+            var results = new List<GlbExportResult>();
+            var manager = _doc.FamilyManager;
+
+            using var transaction = new Transaction(_doc, "AVES Export GLB");
+            var failureOptions = transaction.GetFailureHandlingOptions();
+            failureOptions.SetFailuresPreprocessor(new WarningSwallower());
+            failureOptions.SetClearAfterRollback(true);
+            transaction.SetFailureHandlingOptions(failureOptions);
+
+            transaction.Start();
+            try
+            {
+                for (var i = 0; i < types.Count; i++)
+                {
+                    _statusPrefix = $"Type {i + 1} of {types.Count}: ";
+                    Report(0, 1, types[i].Name);
+                    results.Add(ExportType(manager, types[i]));
+                }
+            }
+            finally
+            {
+                _statusPrefix = "";
+                transaction.RollBack();
+            }
+
+            var clashes = results
+                .Where(r => r.Error == null)
+                .GroupBy(r => r.GlbPath, StringComparer.OrdinalIgnoreCase)
+                .Where(g => g.Count() > 1);
+            foreach (var clash in clashes)
+                _log.Warning($"Types {string.Join(", ", clash.Select(r => $"\"{r.TypeName}\""))} share " +
+                             $"the file name {Path.GetFileName(clash.Key)}, so only the last one is on disk.");
+
+            return results;
+        }
+
+        private GlbExportResult ExportType(FamilyManager manager, FamilyType type)
+        {
+            try
+            {
+                manager.CurrentType = type;
+                _doc.Regenerate();
+            }
+            catch (Exception ex)
+            {
+                return Failed(type.Name, ex);
+            }
+
+            return ExportCurrentTypeSafely();
+        }
+
+        private GlbExportResult ExportCurrentTypeSafely()
+        {
+            var typeName = _doc.FamilyManager.CurrentType?.Name ?? "";
+            try
+            {
+                return ExportCurrentType(typeName);
+            }
+            catch (Exception ex)
+            {
+                return Failed(typeName, ex);
+            }
+        }
+
+        private GlbExportResult Failed(string typeName, Exception ex)
+        {
+            _log.Section($"FAILED: TYPE \"{typeName}\"");
+            _log.Line(ex.ToString());
+            return new GlbExportResult { TypeName = typeName, Error = ex.Message };
+        }
+
+        private GlbExportResult ExportCurrentType(string typeName)
+        {
+            var familyName = FamilyName(_doc);
+            var warningsBefore = _log.WarningCount;
+
+            _log.Section($"TYPE \"{typeName}\"");
 
             var subparts = CollectSubparts();
             var body = CollectBody();
@@ -111,8 +233,10 @@ namespace AVES.Core.GlbExport
             var glbPath = Path.Combine(_options.OutputFolder, baseName + ".glb");
             var bomPath = Path.Combine(_options.OutputFolder, baseName + ".bom.json");
 
-            _progress?.Invoke(subparts.Count, subparts.Count, "Writing GLB…");
+            Report(subparts.Count, subparts.Count, "Writing GLB…");
             GlbFileWriter.Write(glbPath, baseName, nodes, materials);
+
+            var compressed = _options.Compress && Compress(glbPath, subparts.Count);
 
             var bom = new BomFile
             {
@@ -135,17 +259,43 @@ namespace AVES.Core.GlbExport
             bom.Write(bomPath);
 
             LogSummary(subparts, body, nodes, meshes, bom);
-            _log.Line($"IsModified after: {_doc.IsModified}");
-            if (_doc.IsModified != wasModified)
-                _log.Warning("The document's modified state changed during the export.");
 
             return new GlbExportResult
             {
+                TypeName = typeName,
                 GlbPath = glbPath,
                 BomPath = bomPath,
                 Bom = bom,
-                WarningCount = _log.WarningCount,
+                WarningCount = _log.WarningCount - warningsBefore,
+                Compressed = compressed,
             };
+        }
+
+        /// <summary>Compresses the file; a failure only costs a warning.</summary>
+        private bool Compress(string glbPath, int partCount)
+        {
+            Report(partCount, partCount, "Compressing GLB…");
+            var outcome = GlbCompressor.Compress(
+                glbPath,
+                () => Report(partCount, partCount, "Compressing GLB…"));
+
+            if (outcome.Compressed) _log.Line(outcome.Message);
+            else _log.Warning(outcome.Message);
+
+            return outcome.Compressed;
+        }
+
+        private void Report(int current, int total, string status) =>
+            _progress?.Invoke(current, total, _statusPrefix + status);
+
+        /// <summary>Stops Revit warnings from opening dialogs during a type switch.</summary>
+        private sealed class WarningSwallower : IFailuresPreprocessor
+        {
+            public FailureProcessingResult PreprocessFailures(FailuresAccessor failuresAccessor)
+            {
+                failuresAccessor.DeleteAllWarnings();
+                return FailureProcessingResult.Continue;
+            }
         }
 
         /// <summary>The family's name, from the document title without ".rfa".</summary>
@@ -226,7 +376,7 @@ namespace AVES.Core.GlbExport
             foreach (var instance in instances)
             {
                 index++;
-                _progress?.Invoke(index, instances.Count, instance.Symbol.Name);
+                Report(index, instances.Count, instance.Symbol.Name);
 
                 LogInstanceIdentity(instance);
 
@@ -244,7 +394,7 @@ namespace AVES.Core.GlbExport
                 };
                 ReadGeometry(subpart);
 
-                _log.Line($"  subpart name (provisional): \"{subpart.Name}\"");
+                _log.Line($"  subpart name: \"{subpart.Name}\"");
                 _log.Line($"  triangles: {subpart.Geometry.TriangleCount}, " +
                           $"type geometry: {subpart.IsTypeGeometry}, " +
                           $"bounds mm: {subpart.Geometry.Bounds.ToMmString()}");
@@ -455,8 +605,8 @@ namespace AVES.Core.GlbExport
         // ─────────────────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Logs everything that could be the schedule name's source. Values are
-        /// quoted and unmodified so double spaces stay visible.
+        /// Logs what identifies an instance. Values are quoted and unmodified so
+        /// double spaces stay visible.
         /// </summary>
         private void LogInstanceIdentity(FamilyInstance instance)
         {
@@ -467,46 +617,8 @@ namespace AVES.Core.GlbExport
             _log.Line($"Instance {instance.Id.Value}");
             _log.Line($"  family name: \"{symbol.FamilyName}\"");
             _log.Line($"  type name: \"{symbol.Name}\"");
-            _log.Line($"  family and type: \"{instance.get_Parameter(BuiltInParameter.ELEM_FAMILY_AND_TYPE_PARAM)?.AsValueString()}\"");
-            _log.Line($"  category: \"{instance.Category?.Name}\", shared: {IsShared(symbol.Family)}");
-            _log.Line($"  visible param: {(visible == null ? "none" : visible.AsInteger().ToString())}, " +
-                      $"associated formula: {IsVisibilityDriven(instance)}");
+            _log.Line($"  visible param: {(visible == null ? "none" : visible.AsInteger().ToString())}");
             _log.Line($"  mirrored: {instance.Mirrored}");
-            LogStringParameters("instance", instance);
-            LogStringParameters("type", symbol);
-        }
-
-        private static string IsShared(Family family)
-        {
-            var shared = family.get_Parameter(BuiltInParameter.FAMILY_SHARED);
-            return shared == null ? "unknown" : (shared.AsInteger() == 1).ToString();
-        }
-
-        private bool IsVisibilityDriven(FamilyInstance instance)
-        {
-            var visible = instance.get_Parameter(BuiltInParameter.IS_VISIBLE_PARAM);
-            try
-            {
-                return visible != null && _doc.FamilyManager.GetAssociatedFamilyParameter(visible) != null;
-            }
-            catch (Autodesk.Revit.Exceptions.ApplicationException)
-            {
-                return false;
-            }
-        }
-
-        private void LogStringParameters(string scope, Element element)
-        {
-            var parameters = element.Parameters
-                .Cast<Parameter>()
-                .Where(p => p.Definition != null && p.StorageType == StorageType.String)
-                .OrderBy(p => p.Definition.Name, StringComparer.OrdinalIgnoreCase);
-
-            foreach (var parameter in parameters)
-            {
-                var value = parameter.AsString();
-                _log.Line($"  [{scope}] {parameter.Definition.Name} = {(value == null ? "<null>" : $"\"{value}\"")}");
-            }
         }
 
         private void LogBounds(Bounds bounds, Vec3d panelOrigin)
@@ -529,7 +641,7 @@ namespace AVES.Core.GlbExport
             {
                 var count = nodes.Count(n => ReferenceEquals(n.Mesh, mesh));
                 _log.Line($"{mesh.TriangleCount,9} triangles x {count,3} nodes  \"{mesh.Name}\"");
-                if (mesh.TriangleCount > _options.TriangleWarningThreshold)
+                if (_options.FlagPerforations && mesh.TriangleCount > _options.TriangleWarningThreshold)
                     _log.Warning($"\"{mesh.Name}\" has {mesh.TriangleCount} triangles, above the " +
                                  $"{_options.TriangleWarningThreshold} threshold: likely perforated.");
             }
