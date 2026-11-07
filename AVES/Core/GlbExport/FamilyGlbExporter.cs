@@ -8,8 +8,9 @@
 //            Subparts with identical geometry share a mesh, keyed by type and
 //            a geometry hash, so a cut or parameter-driven instance gets its
 //            own. Geometry the family owns directly becomes one "(body)" node
-//            outside the BOM. The origin comes from the exported vertices.
-//            Nothing here writes to the document.
+//            outside the BOM. The panel's size and origin come from the
+//            exported vertices, leaving out hardware that sticks out of the
+//            panel. Nothing here writes to the document.
 // -----------------------------------------------------------------------
 
 using System.Globalization;
@@ -28,6 +29,13 @@ namespace AVES.Core.GlbExport
 
         /// <summary>Meshes above this count are logged as likely perforated.</summary>
         public int TriangleWarningThreshold { get; set; } = 20000;
+
+        /// <summary>
+        /// Subparts whose name contains one of these, ignoring case, are left
+        /// out of the panel's size and origin. They are still exported and
+        /// counted in the BOM.
+        /// </summary>
+        public List<string> FrameExcludedNames { get; set; } = new() { " - Cam", "button fix set" };
     }
 
     /// <summary>What one export run produced.</summary>
@@ -87,9 +95,7 @@ namespace AVES.Core.GlbExport
             var body = CollectBody();
 
             var placed = subparts.Where(s => s.Geometry.TriangleCount > 0).ToList();
-            var bounds = new Bounds();
-            foreach (var part in placed) bounds.Include(part.Geometry.Bounds);
-            if (body != null) bounds.Include(body.Bounds);
+            var bounds = PanelBounds(placed, body);
             if (bounds.IsEmpty)
                 throw new InvalidOperationException("This family has no exportable geometry.");
 
@@ -150,6 +156,32 @@ namespace AVES.Core.GlbExport
                 ? title.Substring(0, title.Length - 4)
                 : title;
         }
+
+        /// <summary>
+        /// The panel's extents without the excluded hardware. If that would
+        /// leave nothing, all the geometry is used instead.
+        /// </summary>
+        private Bounds PanelBounds(List<Subpart> placed, GeometryBuffer? body)
+        {
+            var frameParts = placed.Where(p => !IsFrameExcluded(p.Name)).ToList();
+            if (frameParts.Count == 0 && body == null)
+            {
+                if (placed.Count > 0)
+                    _log.Warning("Every subpart is excluded from the panel frame, so all of them are used.");
+                frameParts = placed;
+            }
+
+            var bounds = new Bounds();
+            foreach (var part in frameParts) bounds.Include(part.Geometry.Bounds);
+            if (body != null) bounds.Include(body.Bounds);
+
+            _log.Section("PANEL FRAME");
+            _log.Line($"Subparts left out of the frame: {placed.Count - frameParts.Count} of {placed.Count}");
+            return bounds;
+        }
+
+        private bool IsFrameExcluded(string subpartName) =>
+            _options.FrameExcludedNames.Any(n => subpartName.Contains(n, StringComparison.OrdinalIgnoreCase));
 
         private static int RoundMm(double feet) =>
             (int)Math.Round(feet * MillimetresPerFoot, MidpointRounding.AwayFromZero);
@@ -268,7 +300,6 @@ namespace AVES.Core.GlbExport
                 subpart.Placement = soleInstance.Transform;
                 subpart.Geometry = new GeometryBuffer(_doc, fallbackMaterial, subpart.Placement, _log);
                 subpart.Geometry.Add(soleInstance.GetSymbolGeometry(), Transform.Identity);
-                LogPlacementCheck(subpart, soleInstance);
             }
             else
             {
@@ -443,8 +474,6 @@ namespace AVES.Core.GlbExport
             _log.Line($"  mirrored: {instance.Mirrored}");
             LogStringParameters("instance", instance);
             LogStringParameters("type", symbol);
-            LogMaterialParameters("instance", instance);
-            LogMaterialParameters("type", symbol);
         }
 
         private static string IsShared(Family family)
@@ -480,84 +509,8 @@ namespace AVES.Core.GlbExport
             }
         }
 
-        private void LogMaterialParameters(string scope, Element element)
-        {
-            var parameters = element.Parameters
-                .Cast<Parameter>()
-                .Where(p => p.Definition != null
-                            && p.StorageType == StorageType.ElementId
-                            && p.Definition.Name.Contains("Material", StringComparison.OrdinalIgnoreCase));
-
-            foreach (var parameter in parameters)
-                _log.Line($"  [{scope}] {parameter.Definition.Name} = \"{parameter.AsValueString()}\"");
-        }
-
-        /// <summary>
-        /// Compares where the exporter puts an instance with Revit's own bounding
-        /// box and instance geometry, which do not use the shared type geometry.
-        /// </summary>
-        private void LogPlacementCheck(Subpart subpart, GeometryInstance typeGeometry)
-        {
-            var instance = subpart.Instance;
-            var placement = subpart.Placement;
-            var own = instance.GetTransform();
-
-            _log.Line($"  placement origin mm: {Mm(placement.Origin)}, axes X{Axis(placement.BasisX)} " +
-                      $"Y{Axis(placement.BasisY)} Z{Axis(placement.BasisZ)}");
-            _log.Line($"  instance transform origin mm: {Mm(own.Origin)}");
-            _log.Line($"  subcomponents: {instance.GetSubComponentIds().Count}");
-
-            foreach (var nested in typeGeometry.GetSymbolGeometry().OfType<GeometryInstance>())
-            {
-                var t = nested.Transform;
-                _log.Line($"  nested in type: origin mm {Mm(t.Origin)}, axes X{Axis(t.BasisX)} " +
-                          $"Y{Axis(t.BasisY)} Z{Axis(t.BasisZ)}");
-            }
-
-            var instanceGeometry = new GeometryBuffer(_doc, NoMaterialKey, Transform.Identity, _log);
-            instanceGeometry.Add(typeGeometry.GetInstanceGeometry(), Transform.Identity);
-            _log.Line($"  Revit instance geometry bounds mm: {instanceGeometry.Bounds.ToMmString()}");
-            WarnIfApart(subpart, instanceGeometry.Bounds, "instance geometry");
-
-            var box = instance.get_BoundingBox(null);
-            if (box == null)
-            {
-                _log.Line("  Revit bounding box: none");
-                return;
-            }
-
-            var revitBounds = new Bounds();
-            revitBounds.Include(ToVec(box.Min));
-            revitBounds.Include(ToVec(box.Max));
-            _log.Line($"  Revit bounding box mm: {revitBounds.ToMmString()}");
-            WarnIfApart(subpart, revitBounds, "bounding box");
-        }
-
-        private void WarnIfApart(Subpart subpart, Bounds reference, string source)
-        {
-            const double toleranceFeet = 1.0 / MillimetresPerFoot;
-            var bounds = subpart.Geometry.Bounds;
-            if (bounds.IsEmpty || reference.IsEmpty) return;
-
-            var apart = new[]
-            {
-                bounds.Min.X - reference.Min.X, bounds.Min.Y - reference.Min.Y, bounds.Min.Z - reference.Min.Z,
-                bounds.Max.X - reference.Max.X, bounds.Max.Y - reference.Max.Y, bounds.Max.Z - reference.Max.Z,
-            }.Max(Math.Abs);
-
-            if (apart > toleranceFeet)
-                _log.Warning($"Instance {subpart.Instance.Id.Value} \"{subpart.Name}\" is " +
-                             $"{apart * MillimetresPerFoot:F1} mm away from Revit's {source}.");
-        }
-
-        private static string Mm(XYZ p) =>
-            $"({p.X * MillimetresPerFoot:F2}, {p.Y * MillimetresPerFoot:F2}, {p.Z * MillimetresPerFoot:F2})";
-
-        private static string Axis(XYZ v) => $"({v.X:F3}, {v.Y:F3}, {v.Z:F3})";
-
         private void LogBounds(Bounds bounds, Vec3d panelOrigin)
         {
-            _log.Section("PANEL FRAME");
             _log.Line($"Bounds in family coordinates, mm: {bounds.ToMmString()}");
             _log.Line($"Applied offset, mm: X {-panelOrigin.X * MillimetresPerFoot:F3}, " +
                       $"Y {-panelOrigin.Y * MillimetresPerFoot:F3}, Z {-panelOrigin.Z * MillimetresPerFoot:F3}");

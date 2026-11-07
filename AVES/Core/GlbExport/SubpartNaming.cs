@@ -14,10 +14,9 @@ namespace AVES.Core.GlbExport
     {
         /// <summary>Builds the subpart name for a nested instance.</summary>
         /// <remarks>
-        /// PROVISIONAL until confirmed: the spike log shows the type's
-        /// Element.Name gives the expected text. The "Family Name" and
-        /// "Type Name" parameters can carry a trailing space that this does
-        /// not, so they are not used.
+        /// The name is the type's Element.Name. The "Family Name" and
+        /// "Type Name" parameters are not used: they can carry a trailing
+        /// space that the schedule text does not show.
         /// </remarks>
         public static string BuildName(FamilyInstance instance) => instance.Symbol.Name;
     }
