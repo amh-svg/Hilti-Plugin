@@ -143,7 +143,7 @@ namespace AVES.Core.GlbExport
         }
 
         /// <summary>The family's name, from the document title without ".rfa".</summary>
-        private static string FamilyName(Document doc)
+        internal static string FamilyName(Document doc)
         {
             var title = doc.Title;
             return title.EndsWith(".rfa", StringComparison.OrdinalIgnoreCase)
@@ -266,13 +266,14 @@ namespace AVES.Core.GlbExport
             {
                 subpart.IsTypeGeometry = true;
                 subpart.Placement = soleInstance.Transform;
-                subpart.Geometry = new GeometryBuffer(fallbackMaterial, subpart.Placement, _log);
+                subpart.Geometry = new GeometryBuffer(_doc, fallbackMaterial, subpart.Placement, _log);
                 subpart.Geometry.Add(soleInstance.GetSymbolGeometry(), Transform.Identity);
+                LogPlacementCheck(subpart, soleInstance);
             }
             else
             {
                 subpart.Placement = Transform.Identity;
-                subpart.Geometry = new GeometryBuffer(fallbackMaterial, Transform.Identity, _log);
+                subpart.Geometry = new GeometryBuffer(_doc, fallbackMaterial, Transform.Identity, _log);
                 if (geometry != null) subpart.Geometry.Add(geometry, Transform.Identity);
             }
         }
@@ -295,7 +296,7 @@ namespace AVES.Core.GlbExport
                 .OrderBy(e => e.Id.Value)
                 .ToList();
 
-            var body = new GeometryBuffer(NoMaterialKey, Transform.Identity, _log);
+            var body = new GeometryBuffer(_doc, NoMaterialKey, Transform.Identity, _log);
             foreach (var element in elements)
             {
                 if (element is GenericForm { IsSolid: false }) continue;
@@ -442,6 +443,8 @@ namespace AVES.Core.GlbExport
             _log.Line($"  mirrored: {instance.Mirrored}");
             LogStringParameters("instance", instance);
             LogStringParameters("type", symbol);
+            LogMaterialParameters("instance", instance);
+            LogMaterialParameters("type", symbol);
         }
 
         private static string IsShared(Family family)
@@ -476,6 +479,81 @@ namespace AVES.Core.GlbExport
                 _log.Line($"  [{scope}] {parameter.Definition.Name} = {(value == null ? "<null>" : $"\"{value}\"")}");
             }
         }
+
+        private void LogMaterialParameters(string scope, Element element)
+        {
+            var parameters = element.Parameters
+                .Cast<Parameter>()
+                .Where(p => p.Definition != null
+                            && p.StorageType == StorageType.ElementId
+                            && p.Definition.Name.Contains("Material", StringComparison.OrdinalIgnoreCase));
+
+            foreach (var parameter in parameters)
+                _log.Line($"  [{scope}] {parameter.Definition.Name} = \"{parameter.AsValueString()}\"");
+        }
+
+        /// <summary>
+        /// Compares where the exporter puts an instance with Revit's own bounding
+        /// box and instance geometry, which do not use the shared type geometry.
+        /// </summary>
+        private void LogPlacementCheck(Subpart subpart, GeometryInstance typeGeometry)
+        {
+            var instance = subpart.Instance;
+            var placement = subpart.Placement;
+            var own = instance.GetTransform();
+
+            _log.Line($"  placement origin mm: {Mm(placement.Origin)}, axes X{Axis(placement.BasisX)} " +
+                      $"Y{Axis(placement.BasisY)} Z{Axis(placement.BasisZ)}");
+            _log.Line($"  instance transform origin mm: {Mm(own.Origin)}");
+            _log.Line($"  subcomponents: {instance.GetSubComponentIds().Count}");
+
+            foreach (var nested in typeGeometry.GetSymbolGeometry().OfType<GeometryInstance>())
+            {
+                var t = nested.Transform;
+                _log.Line($"  nested in type: origin mm {Mm(t.Origin)}, axes X{Axis(t.BasisX)} " +
+                          $"Y{Axis(t.BasisY)} Z{Axis(t.BasisZ)}");
+            }
+
+            var instanceGeometry = new GeometryBuffer(_doc, NoMaterialKey, Transform.Identity, _log);
+            instanceGeometry.Add(typeGeometry.GetInstanceGeometry(), Transform.Identity);
+            _log.Line($"  Revit instance geometry bounds mm: {instanceGeometry.Bounds.ToMmString()}");
+            WarnIfApart(subpart, instanceGeometry.Bounds, "instance geometry");
+
+            var box = instance.get_BoundingBox(null);
+            if (box == null)
+            {
+                _log.Line("  Revit bounding box: none");
+                return;
+            }
+
+            var revitBounds = new Bounds();
+            revitBounds.Include(ToVec(box.Min));
+            revitBounds.Include(ToVec(box.Max));
+            _log.Line($"  Revit bounding box mm: {revitBounds.ToMmString()}");
+            WarnIfApart(subpart, revitBounds, "bounding box");
+        }
+
+        private void WarnIfApart(Subpart subpart, Bounds reference, string source)
+        {
+            const double toleranceFeet = 1.0 / MillimetresPerFoot;
+            var bounds = subpart.Geometry.Bounds;
+            if (bounds.IsEmpty || reference.IsEmpty) return;
+
+            var apart = new[]
+            {
+                bounds.Min.X - reference.Min.X, bounds.Min.Y - reference.Min.Y, bounds.Min.Z - reference.Min.Z,
+                bounds.Max.X - reference.Max.X, bounds.Max.Y - reference.Max.Y, bounds.Max.Z - reference.Max.Z,
+            }.Max(Math.Abs);
+
+            if (apart > toleranceFeet)
+                _log.Warning($"Instance {subpart.Instance.Id.Value} \"{subpart.Name}\" is " +
+                             $"{apart * MillimetresPerFoot:F1} mm away from Revit's {source}.");
+        }
+
+        private static string Mm(XYZ p) =>
+            $"({p.X * MillimetresPerFoot:F2}, {p.Y * MillimetresPerFoot:F2}, {p.Z * MillimetresPerFoot:F2})";
+
+        private static string Axis(XYZ v) => $"({v.X:F3}, {v.Y:F3}, {v.Z:F3})";
 
         private void LogBounds(Bounds bounds, Vec3d panelOrigin)
         {
@@ -568,6 +646,7 @@ namespace AVES.Core.GlbExport
     /// </summary>
     internal sealed class GeometryBuffer
     {
+        private readonly Document _doc;
         private readonly long _fallbackMaterial;
         private readonly Transform _placement;
         private readonly GlbExportLog _log;
@@ -576,11 +655,13 @@ namespace AVES.Core.GlbExport
         public Bounds Bounds { get; } = new();
         public int TriangleCount => Triangles.Values.Sum(t => t.Count);
 
+        /// <param name="doc">The document the geometry came from.</param>
         /// <param name="fallbackMaterial">Material key for unassigned geometry.</param>
         /// <param name="placement">Local frame to family coordinates.</param>
         /// <param name="log">The run log.</param>
-        public GeometryBuffer(long fallbackMaterial, Transform placement, GlbExportLog log)
+        public GeometryBuffer(Document doc, long fallbackMaterial, Transform placement, GlbExportLog log)
         {
+            _doc = doc;
             _fallbackMaterial = fallbackMaterial;
             _placement = placement;
             _log = log;
@@ -597,10 +678,10 @@ namespace AVES.Core.GlbExport
                 {
                     case Solid solid:
                         foreach (Face face in solid.Faces)
-                            AddFace(face, toLocal);
+                            AddFace(face, solid.GraphicsStyleId, toLocal);
                         break;
                     case RevitMesh mesh:
-                        AddMesh(mesh, mesh.MaterialElementId, toLocal);
+                        AddMesh(mesh, MaterialKey(mesh.MaterialElementId, mesh.GraphicsStyleId), toLocal);
                         break;
                     case GeometryInstance instance:
                         Add(instance.GetSymbolGeometry(), toLocal.Multiply(instance.Transform));
@@ -609,12 +690,12 @@ namespace AVES.Core.GlbExport
             }
         }
 
-        private void AddFace(Face face, Transform toLocal)
+        private void AddFace(Face face, ElementId styleId, Transform toLocal)
         {
             try
             {
                 var mesh = face.Triangulate();
-                if (mesh != null) AddMesh(mesh, face.MaterialElementId, toLocal);
+                if (mesh != null) AddMesh(mesh, MaterialKey(face.MaterialElementId, styleId), toLocal);
             }
             catch (Autodesk.Revit.Exceptions.ApplicationException ex)
             {
@@ -622,9 +703,20 @@ namespace AVES.Core.GlbExport
             }
         }
 
-        private void AddMesh(RevitMesh mesh, ElementId materialId, Transform toLocal)
+        /// <summary>
+        /// The material key: the face's own material, then its subcategory's, then
+        /// the fallback.
+        /// </summary>
+        private long MaterialKey(ElementId materialId, ElementId styleId)
         {
-            var key = materialId != ElementId.InvalidElementId ? materialId.Value : _fallbackMaterial;
+            if (materialId != ElementId.InvalidElementId) return materialId.Value;
+
+            var style = _doc.GetElement(styleId) as GraphicsStyle;
+            return style?.GraphicsStyleCategory?.Material?.Id.Value ?? _fallbackMaterial;
+        }
+
+        private void AddMesh(RevitMesh mesh, long key, Transform toLocal)
+        {
             if (!Triangles.TryGetValue(key, out var triangles))
             {
                 triangles = new List<ExportTriangle>();

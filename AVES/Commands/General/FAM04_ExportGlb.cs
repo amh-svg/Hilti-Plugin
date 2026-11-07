@@ -41,7 +41,7 @@ namespace AVES.Commands
             GlbExportLog? log = null;
             try
             {
-                log = new GlbExportLog(logFolder, ExportFileNames.BaseName(doc.Title, ""));
+                log = new GlbExportLog(logFolder, ExportFileNames.BaseName(FamilyGlbExporter.FamilyName(doc), ""));
 
                 var options = new GlbExportOptions
                 {

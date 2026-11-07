@@ -14,15 +14,11 @@ namespace AVES.Core.GlbExport
     {
         /// <summary>Builds the subpart name for a nested instance.</summary>
         /// <remarks>
-        /// PROVISIONAL: "family_type" fits most of the known names, such as
-        /// "LB4-PRT-0010_LB4-PRT-0010-084", but the real source is unconfirmed
-        /// and "button fix set" probably does not follow it. Replace this once
-        /// the spike log has identified the rule.
+        /// PROVISIONAL until confirmed: the spike log shows the type's
+        /// Element.Name gives the expected text. The "Family Name" and
+        /// "Type Name" parameters can carry a trailing space that this does
+        /// not, so they are not used.
         /// </remarks>
-        public static string BuildName(FamilyInstance instance)
-        {
-            var symbol = instance.Symbol;
-            return $"{symbol.FamilyName}_{symbol.Name}";
-        }
+        public static string BuildName(FamilyInstance instance) => instance.Symbol.Name;
     }
 }
