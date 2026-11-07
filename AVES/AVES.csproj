@@ -72,6 +72,11 @@
 	</ItemGroup>
 
 	<ItemGroup>
+		<!-- GLB writing for the Export GLB + BOM command -->
+		<PackageReference Include="SharpGLTF.Toolkit" Version="1.0.7" />
+	</ItemGroup>
+
+	<ItemGroup>
 		<Resource Include="Resources\Icons\RibbonIcon16.png" />
 		<Resource Include="Resources\Icons\RibbonIcon32.png" />
 	</ItemGroup>

@@ -51,6 +51,9 @@ Source: "{#BinR25}\AVES.deps.json";                  DestDir: "{#AddinsDir}\2025
 Source: "{#BinR25}\AVES.runtimeconfig.json";         DestDir: "{#AddinsDir}\2025"; Check: IsRevitInstalled('2025'); Flags: ignoreversion uninsrestartdelete
 Source: "{#BinR25}\Nice3point.Revit.Extensions.dll"; DestDir: "{#AddinsDir}\2025"; Check: IsRevitInstalled('2025'); Flags: ignoreversion uninsrestartdelete
 Source: "{#BinR25}\Nice3point.Revit.Toolkit.dll";    DestDir: "{#AddinsDir}\2025"; Check: IsRevitInstalled('2025'); Flags: ignoreversion uninsrestartdelete
+Source: "{#BinR25}\SharpGLTF.Core.dll";                      DestDir: "{#AddinsDir}\2025"; Check: IsRevitInstalled('2025'); Flags: ignoreversion uninsrestartdelete
+Source: "{#BinR25}\SharpGLTF.Runtime.dll";                   DestDir: "{#AddinsDir}\2025"; Check: IsRevitInstalled('2025'); Flags: ignoreversion uninsrestartdelete
+Source: "{#BinR25}\SharpGLTF.Toolkit.dll";                   DestDir: "{#AddinsDir}\2025"; Check: IsRevitInstalled('2025'); Flags: ignoreversion uninsrestartdelete
 Source: "{#SourcePath}AVES.addin";                   DestDir: "{#AddinsDir}\2025"; Check: IsRevitInstalled('2025'); Flags: ignoreversion uninsrestartdelete
 
 ; Revit 2026
@@ -59,6 +62,9 @@ Source: "{#BinR26}\AVES.deps.json";                  DestDir: "{#AddinsDir}\2026
 Source: "{#BinR26}\AVES.runtimeconfig.json";         DestDir: "{#AddinsDir}\2026"; Check: IsRevitInstalled('2026'); Flags: ignoreversion uninsrestartdelete
 Source: "{#BinR26}\Nice3point.Revit.Extensions.dll"; DestDir: "{#AddinsDir}\2026"; Check: IsRevitInstalled('2026'); Flags: ignoreversion uninsrestartdelete
 Source: "{#BinR26}\Nice3point.Revit.Toolkit.dll";    DestDir: "{#AddinsDir}\2026"; Check: IsRevitInstalled('2026'); Flags: ignoreversion uninsrestartdelete
+Source: "{#BinR26}\SharpGLTF.Core.dll";                      DestDir: "{#AddinsDir}\2026"; Check: IsRevitInstalled('2026'); Flags: ignoreversion uninsrestartdelete
+Source: "{#BinR26}\SharpGLTF.Runtime.dll";                   DestDir: "{#AddinsDir}\2026"; Check: IsRevitInstalled('2026'); Flags: ignoreversion uninsrestartdelete
+Source: "{#BinR26}\SharpGLTF.Toolkit.dll";                   DestDir: "{#AddinsDir}\2026"; Check: IsRevitInstalled('2026'); Flags: ignoreversion uninsrestartdelete
 Source: "{#SourcePath}AVES.addin";                   DestDir: "{#AddinsDir}\2026"; Check: IsRevitInstalled('2026'); Flags: ignoreversion uninsrestartdelete
 
 [Code]
