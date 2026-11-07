@@ -168,4 +168,7 @@
   <data name="DOC09_CleanViews" xml:space="preserve">
     <value>On the open sheet, hide everything in the chosen views except the Generic Model elements of the assembly shown and tags. If a view shows several assemblies, you choose which one to keep. One undo reverses the run.</value>
   </data>
+  <data name="FAM04_ExportGlb" xml:space="preserve">
+    <value>In the Family Editor, export the active family as a GLB with one named node per subpart, plus a BOM JSON with the subpart quantities for the web app.</value>
+  </data>
 </root>
